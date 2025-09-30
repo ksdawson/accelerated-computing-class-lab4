@@ -49,35 +49,42 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
-template <bool row_major>
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
     float const *a, float const *b, float *c, // Matrices
     uint32_t start_i, uint32_t start_k, // Tile in c location
     uint32_t local_size_i, uint32_t local_size_k // Tile in c dimensions
     ) {
-    // Math: c_ik = sum(a_ij * b_jk) for all j < size_j
-    uint32_t threads_per_elem = max(blockDim.x / (local_size_i * local_size_k), 1);
-    for (uint32_t idx = threadIdx.x / threads_per_elem; idx < local_size_i * local_size_k; idx += blockDim.x / threads_per_elem) {
+    // Math: c_ik = a_i ⋅ b_k
+    // Goal: c_ik in registers and a_i, b_k in L1 cache
+    // Plan: Each thread works on one c_ik at a time
+    
+    // More than one thread may need to split a c_ik
+    uint32_t threads_per_c_ik = max(blockDim.x / (local_size_i * local_size_k), 1);
+    uint32_t start_idx = threadIdx.x / threads_per_c_ik;
+    uint32_t end_idx = local_size_i * local_size_k;
+    uint32_t step_size = blockDim.x / threads_per_c_ik;
+    uint32_t local_size_j = size_j / threads_per_c_ik;
+    
+    // Iterate over c_ik's
+    for (uint32_t idx = start_idx; idx < end_idx; idx += step_size) {
         // Get indices
-        uint32_t i = start_i + (row_major ? idx / local_size_k : 0); // TODO: col major
-        uint32_t k = start_k + (row_major ? idx % local_size_k : 0);
-        // Local thread
-        uint32_t local_thread_idx = threadIdx.x % threads_per_elem;
-        for (uint32_t j = (size_j / threads_per_elem) * local_thread_idx; j < (size_j / threads_per_elem) * (local_thread_idx + 1); ++j) {
-            // Compute the flop
-            c[i * size_k + k] += a[i * size_j + j] * b[j * size_k + k];
+        uint32_t i = start_i + idx / local_size_k;
+        uint32_t k = start_k + idx % local_size_k;
+        // Get local thread idx
+        uint32_t local_idx = threadIdx.x % threads_per_c_ik;
+        // Get j iteration bounds
+        uint32_t start_j = local_size_j * local_idx;
+        uint32_t end_j = start_j + local_size_j;
+        // Keep c_ik in local register
+        float local_c_ik = 0.0f;
+        // Iterate over a_i, b_k
+        for (uint32_t j = start_j; j < end_j; ++j) {
+            local_c_ik += a[i * size_j + j] * b[j * size_k + k];
         }
+        // Write back to main memory at the end
+        c[i * size_k + k] += local_c_ik; // Might cause race conditions
     }
-
-    // for (uint32_t idx = threadIdx.x; idx < local_size_i * size_j * local_size_k; idx += blockDim.x) {
-    //     // Get indices
-    //     uint32_t i = start_i + (row_major ? (idx / size_j) / local_size_k : 0); // TODO: col major
-    //     uint32_t j = 0 + (row_major ? idx % size_j : 0);
-    //     uint32_t k = start_k + (row_major ? (idx / size_j) % local_size_k : 0);
-    //     // Compute the flop
-    //     c[i * size_k + k] += a[i * size_j + j] * b[j * size_k + k];
-    // }
 }
 
 __global__ void matmul_l1(
@@ -88,13 +95,12 @@ __global__ void matmul_l1(
     float const *b,
     float *c) {
     // Grid dimensions
-    constexpr bool row_major = true; // Tuning parameter
     constexpr uint32_t tiles_per_row = 48; // Tuning parameter
     uint32_t tiles_per_col = gridDim.x / tiles_per_row;
 
     // Tile location
-    uint32_t tile_i = row_major ? blockIdx.x / size_k : blockIdx.x % size_i;
-    uint32_t tile_k = row_major ? blockIdx.x % size_k : blockIdx.x / size_i;
+    uint32_t tile_i = blockIdx.x / size_k;
+    uint32_t tile_k = blockIdx.x % size_k;
 
     // Tile dimensions
     uint32_t tile_height = size_i / tiles_per_col;
@@ -115,7 +121,7 @@ __global__ void matmul_l1(
         ? tile_k * tile_width
         : extra_width * (tile_width + 1) + (tile_k - extra_width) * tile_width;
 
-    matmul_tile<row_major>(
+    matmul_tile(
         size_i, size_j, size_k,
         a, b, c,
         start_i, start_k,
@@ -130,8 +136,13 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
+    // Optimization strategy:
+    // (1) a, b in L1 cache; c in registers
+    // (2) prefetch next tile into L2
+    // (3) transpose b
+
     // Ideal would be a is row, b is col, and c is row
-    // We might have to do it ourselves
+    // We might have to do it ourselves -> transpose b
     // Part 2 lower bound: 17ms
     matmul_l1<<<48, 32 * 32>>>(size_i, size_j, size_k, a, b, c);
 }
@@ -161,6 +172,7 @@ void launch_matmul_l1_reg(
     float const *b,
     float *c) {
     /* TODO: your CPU code here */
+    // Lower bound: 5ms
 }
 
 }; // namespace matmul_l1_reg
