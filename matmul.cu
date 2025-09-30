@@ -99,8 +99,8 @@ __global__ void matmul_l1(
     uint32_t tiles_per_col = gridDim.x / tiles_per_row;
 
     // Tile location
-    uint32_t tile_i = blockIdx.x / size_k;
-    uint32_t tile_k = blockIdx.x % size_k;
+    uint32_t tile_i = blockIdx.x / tiles_per_row;
+    uint32_t tile_k = blockIdx.x % tiles_per_row;
 
     // Tile dimensions
     uint32_t tile_height = size_i / tiles_per_col;
