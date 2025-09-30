@@ -56,7 +56,45 @@ __global__ void matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+    // Grid dimensions
+    constexpr bool row_major = false; // Tuning parameter
+    constexpr uint32_t tiles_per_row = 48; // Tuning parameter
+    uint32_t tiles_per_col = gridDim.x / tiles_per_row;
+
+    // Tile location
+    uint32_t tile_i = row_major ? blockIdx.x / size_k : blockIdx.x % size_i;
+    uint32_t tile_k = row_major ? blockIdx.x % size_k : blockIdx.x / size_i;
+
+    // Tile dimensions
+    uint32_t tile_height = size_i / tiles_per_col;
+    uint32_t tile_width = size_k / tiles_per_row;
+
+    // Handle extra
+    uint32_t extra_height = size_i % tiles_per_col;
+    uint32_t extra_width = size_k % tiles_per_row;
+
+    // Element location
+    uint32_t start_i = max(tile_i - extra_height, 0) * tile_height;
+    uint32_t start_k = max(tile_k - extra_width, 0) * tile_width;
+
+    // Spread extra over first rows and cols
+    tile_height += (tile_i < extra_height) ? 1 : 0;
+    tile_width += (tile_k < extra_width) ? 1 : 0;
+
+    // Update location
+    start_i += tile_i * tile_height;
+    start_k += tile_k * tile_width;
+
+    // Iterate over the tile in the output
+    for (uint32_t idx = threadIdx.x; idx < tile_height * tile_width; idx += blockDim.x) {
+        // Get elem idx
+        uint32_t i = start_i + (row_major ? idx / tile_width : idx % tile_height);
+        uint32_t k = start_k + (row_major ? idx % tile_width : idx / tile_height);
+        // Compute the elem
+        for (uint32_t j = 0; j < size_j; ++j) {
+            c[i * size_k + k] += a[i * size_j + j] * b[j * size_k + k];
+        }
+    }
 }
 
 void launch_matmul_l1(
@@ -66,7 +104,7 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+    matmul_l1<<<48, 32 * 32>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1
