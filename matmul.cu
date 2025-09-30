@@ -57,11 +57,14 @@ __device__ void matmul_tile(
     uint32_t local_size_i, uint32_t local_size_k // Tile in c dimensions
     ) {
     // Math: c_ik = sum(a_ij * b_jk) for all j < size_j
-    for (uint32_t idx = threadIdx.x; idx < local_size_i * local_size_k; idx += blockDim.x) {
+    uint32_t threads_per_elem = max(blockDim.x / (local_size_i * local_size_k), 1);
+    for (uint32_t idx = threadIdx.x / threads_per_elem; idx < local_size_i * local_size_k; idx += blockDim.x / threads_per_elem) {
         // Get indices
         uint32_t i = start_i + (row_major ? idx / local_size_k : 0); // TODO: col major
         uint32_t k = start_k + (row_major ? idx % local_size_k : 0);
-        for (uint32_t j = 0; j < size_j; ++j) {
+        // Local thread
+        uint32_t local_thread_idx = threadIdx.x % threads_per_elem;
+        for (uint32_t j = (size_j / threads_per_elem) * local_thread_idx; j < (size_j / threads_per_elem) * (local_thread_idx + 1); ++j) {
             // Compute the flop
             c[i * size_k + k] += a[i * size_j + j] * b[j * size_k + k];
         }
