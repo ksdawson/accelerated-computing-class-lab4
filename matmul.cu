@@ -49,123 +49,67 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
-__device__ void matmul_tile(
-    uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
-    float const *a, float const *b, float *c, // Matrices
-    uint32_t start_i, uint32_t start_k, // Tile in c location
-    uint32_t local_size_i, uint32_t local_size_k // Tile in c dimensions
-    ) {
-    // Math: c_ik = a_i ⋅ b_k
-    // Goal: c_ik in registers and a_i, b_k in L1 cache
-    // Plan: Each thread works on one c_ik at a time
-    
-    // More than one thread may need to split a c_ik
-    uint32_t threads_per_c_ik = max(blockDim.x / (local_size_i * local_size_k), 1);
-    uint32_t start_idx = threadIdx.x / threads_per_c_ik;
-    uint32_t end_idx = local_size_i * local_size_k;
-    uint32_t step_size = blockDim.x / threads_per_c_ik;
-    uint32_t local_size_j = size_j / threads_per_c_ik;
-    
-    // Iterate over c_ik's
-    for (uint32_t idx = start_idx; idx < end_idx; idx += step_size) {
-        // Get indices
-        uint32_t i = start_i + idx / local_size_k;
-        uint32_t k = start_k + idx % local_size_k;
-        // Get local thread idx
-        uint32_t local_idx = threadIdx.x % threads_per_c_ik;
-        // Get j iteration bounds
-        uint32_t start_j = local_size_j * local_idx;
-        uint32_t end_j = start_j + local_size_j;
-        // Keep c_ik in local register
-        float local_c_ik = 0.0f;
-        // Iterate over a_i, b_k
-        for (uint32_t j = start_j; j < end_j; ++j) {
-            // local_c_ik += a[i * size_j + j] * b[j * size_k + k];
-            local_c_ik += a[i * size_j + j] * b[k * size_j + j];
-            // local_c_ik += __ldg(&a[i * size_j + j]) * __ldg(&b[j * size_k + k]);
-        }
-        // Write back to main memory at the end
-        c[i * size_k + k] += local_c_ik; // Might cause race conditions
-        // atomicAdd(&c[i * size_k + k], local_c_ik);
+__device__ void load_tile(uint32_t n_rows, uint32_t n_cols) {
+    for (uint32_t idx = threadIdx.x; idx < n_rows * n_cols; idx += blockDim.x) {
+        uint32_t i = idx / n_cols;
+        uint32_t j = idx % n_cols;
     }
 }
 
-__global__ void matmul_l1(
-    int32_t size_i,
-    int32_t size_j,
-    int32_t size_k,
-    float const *a,
-    float const *b,
-    float *c) {
-    // Grid dimensions
-    constexpr uint32_t tiles_per_row = 8; // Tuning parameter
-    uint32_t tiles_per_col = gridDim.x / tiles_per_row;
+__device__ void matmul_tile(
+    uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
+    float const *a, float const *b, float *c, // Matrices
+    uint32_t n // Tile size
+) {
+    // Math: c_ik = a_i ⋅ b_k
+    // Goal: c_ik in registers and a_i, b_k in L1 cache
+    // Plan: Each thread works on one c_ik at a time
 
-    // Tile location
-    uint32_t tile_i = blockIdx.x / tiles_per_row;
-    uint32_t tile_k = blockIdx.x % tiles_per_row;
+    // Each thread gets a c_ik
+    uint32_t i = threadIdx.x / n;
+    uint32_t k = threadIdx.x % n;
 
-    // Tile dimensions
-    uint32_t tile_height = size_i / tiles_per_col;
-    uint32_t tile_width = size_k / tiles_per_row;
+    // Keep c_ik in local register
+    float local_c_ik = 0.0f;
 
-    // Handle extra
-    uint32_t extra_height = size_i % tiles_per_col;
-    uint32_t extra_width = size_k % tiles_per_row;
-    // Spread extra over first rows and cols
-    tile_height += (tile_i < extra_height) ? 1 : 0;
-    tile_width += (tile_k < extra_width) ? 1 : 0;
+    // Iterate over a_i, b_k
+    for (uint32_t j = 0; j < size_j; ++j) {
+        local_c_ik += a[i * size_j + j] * b[j * size_k + k];
+    }
 
-    // Element location
-    uint32_t start_i = tile_i < extra_height
-        ? tile_i * tile_height
-        : extra_height * (tile_height + 1) + (tile_i - extra_height) * tile_height;
-    uint32_t start_k = tile_k < extra_width
-        ? tile_k * tile_width
-        : extra_width * (tile_width + 1) + (tile_k - extra_width) * tile_width;
-
-    // // Split equally across a rows and b cols
-    // uint32_t vectors = 25000 / size_j;
-    // uint32_t a_rows = vectors/2 + vectors % 2;
-    // uint32_t b_cols = vectors/2;
-
-    // // Iterate over the tile because the whole tile might not fit into the SRAM
-    // for (uint32_t k = 0; k < tile_width; k += b_cols) {
-    //     uint32_t curr_b_cols = min(b_cols, tile_width - k);
-    //     for (uint32_t i = 0; i < tile_height; i += a_rows) {
-    //         uint32_t curr_a_rows = min(a_rows, tile_height - i);
-    //         matmul_tile(
-    //             size_i, size_j, size_k,
-    //             a, b, c,
-    //             start_i + i, start_k + k,
-    //             curr_a_rows, curr_b_cols
-    //         );
-
-    //         // Need to wait for all threads to finish w/ what's in the SRAM
-    //         __syncthreads();
-    //     }
-    // }
-
-    matmul_tile(
-        size_i, size_j, size_k,
-        a, b, c,
-        start_i, start_k,
-        tile_height, tile_width
-    );
+    // Write back to main memory at the end
+    c[i * size_k + k] = local_c_ik;
 }
 
-__global__ void transpose_square_matrix(float *matrix, uint32_t n) {
-    uint32_t tot_threads = gridDim.x * blockDim.x;
-    uint32_t thread_index = blockIdx.x * blockDim.x + threadIdx.x;
-    for (uint32_t idx = thread_index; idx < n * n; idx += tot_threads) {
-        uint32_t i = idx / n;
-        uint32_t j = idx % n;
-        // Swap matrix[i][j] with matrix[j][i]
-        if (i < j) {
-            float temp = matrix[i * n + j];
-            matrix[i * n + j] = matrix[j * n + i];
-            matrix[j * n + i] = temp;
-        }
+__global__ void matmul_l1(
+    int32_t size_i, int32_t size_j, int32_t size_k,
+    float const *a, float const *b, float *c
+) {
+    // c_ik tiles are 32x32
+    constexpr uint32_t n = 32;
+
+    // Grid dimensions
+    uint32_t tiles_per_row = size_k / n;
+    uint32_t tiles_per_col = size_j / n;
+
+    // Iterate over tiles
+    for (uint32_t idx = blockIdx.x; idx < tiles_per_col * tiles_per_row; idx += gridDim.x) {
+        // Tile indices
+        // uint32_t tile_i = idx / tiles_per_row; // Row major
+        // uint32_t tile_k = idx % tiles_per_row;
+        uint32_t tile_k = idx / tiles_per_col; // Col major
+        uint32_t tile_i = idx % tiles_per_col;
+
+        // Move buffers
+        float const *tile_a = a + tile_i * n * size_j;
+        float const *tile_b = b + tile_k * n;
+        float *tile_c = c + tile_i * n * size_j + tile_k * n;
+
+        matmul_tile(
+            size_i, size_j, size_k,
+            tile_a, tile_b, tile_c,
+            n
+        );
     }
 }
 
@@ -176,21 +120,10 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    // Optimization strategy:
-    // (1) a, b in L1 cache; c in registers
-    // (2) prefetch next tile into L2
-    // (3) transpose b
-
-    // We want: a -> row major, b -> col major, c -> row major
-    transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
-    // transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Undo for testing
-    // (b^T)^T = b added less than 1-2ms
-
-    // Ideal would be a is row, b is col, and c is row
-    // We might have to do it ourselves -> transpose b
-    // Part 2 lower bound: 17ms
     matmul_l1<<<48, 32 * 32>>>(size_i, size_j, size_k, a, b, c);
 }
+
+// Part 2 lower bound: 17ms
 
 }; // namespace matmul_l1
 
