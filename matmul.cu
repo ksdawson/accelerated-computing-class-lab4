@@ -68,6 +68,24 @@ __device__ void copy_mem(float *src, float *dst, uint32_t buffer_width,
     __syncthreads();
 }
 
+__device__ void copy_mem_col(float *src, float *dst, uint32_t buffer_width,
+    uint32_t n_cols, uint32_t start_j
+    ) {
+    // Copy data from one buffer to another
+    for (uint32_t thread_idx = threadIdx.x; thread_idx < n_cols * buffer_width; thread_idx += blockDim.x) {
+        // Get local idx
+        uint32_t j = thread_idx / n_cols;
+        uint32_t i = thread_idx % n_cols;
+        // Get dst idx
+        uint32_t dst_idx = i * buffer_width + j;
+        // Get src idx
+        uint32_t src_idx = i * buffer_width + (start_j + j);
+        // Copy memory over
+        dst[dst_idx] = src[src_idx];
+    }
+    __syncthreads();
+}
+
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
     float *a, float *b, float *c, // Matrices
@@ -100,8 +118,8 @@ __device__ void matmul_tile(
         float local_c_ik = 0.0f;
         // Iterate over a_i, b_k
         for (uint32_t j = start_j; j < end_j; ++j) {
-            // local_c_ik += a[i * size_j + j] * b[j * size_k + k];
-            local_c_ik += a[i * size_j + j] * b[k * size_j + j];
+            local_c_ik += a[i * size_j + j] * b[j * local_size_k + k];
+            // local_c_ik += a[i * size_j + j] * b[k * size_j + j];
         }
         // Write back to main memory at the end
         c[(start_i + i) * size_k + (start_k + k)] += local_c_ik; // Might cause race conditions
@@ -152,7 +170,7 @@ __global__ void matmul_l1(
     for (uint32_t k = 0; k < tile_width; k += b_cols) {
         // Load b cols
         uint32_t curr_b_cols = min(b_cols, tile_width - k);
-        copy_mem(b, local_b, size_j, curr_b_cols, start_k + k);
+        copy_mem_col(b, local_b, size_j, curr_b_cols, start_k + k);
 
         for (uint32_t i = 0; i < tile_height; i += a_rows) {
             // Load a rows
@@ -196,7 +214,7 @@ void launch_matmul_l1(
     float const *b,
     float *c) {
     // We want: a -> row major, b -> col major, c -> row major
-    transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
+    // transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
 
     // Setup the block SRAM
     int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
