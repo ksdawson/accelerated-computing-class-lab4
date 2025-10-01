@@ -80,10 +80,13 @@ __device__ void matmul_tile(
         float local_c_ik = 0.0f;
         // Iterate over a_i, b_k
         for (uint32_t j = start_j; j < end_j; ++j) {
-            local_c_ik += a[i * size_j + j] * b[j * size_k + k];
+            // local_c_ik += a[i * size_j + j] * b[j * size_k + k];
+            local_c_ik += a[i * size_j + j] * b[k * size_j + j];
+            // local_c_ik += __ldg(&a[i * size_j + j]) * __ldg(&b[j * size_k + k]);
         }
         // Write back to main memory at the end
         c[i * size_k + k] += local_c_ik; // Might cause race conditions
+        // atomicAdd(&c[i * size_k + k], local_c_ik);
     }
 }
 
@@ -95,7 +98,7 @@ __global__ void matmul_l1(
     float const *b,
     float *c) {
     // Grid dimensions
-    constexpr uint32_t tiles_per_row = 48; // Tuning parameter
+    constexpr uint32_t tiles_per_row = 8; // Tuning parameter
     uint32_t tiles_per_col = gridDim.x / tiles_per_row;
 
     // Tile location
@@ -120,6 +123,28 @@ __global__ void matmul_l1(
     uint32_t start_k = tile_k < extra_width
         ? tile_k * tile_width
         : extra_width * (tile_width + 1) + (tile_k - extra_width) * tile_width;
+
+    // // Split equally across a rows and b cols
+    // uint32_t vectors = 25000 / size_j;
+    // uint32_t a_rows = vectors/2 + vectors % 2;
+    // uint32_t b_cols = vectors/2;
+
+    // // Iterate over the tile because the whole tile might not fit into the SRAM
+    // for (uint32_t k = 0; k < tile_width; k += b_cols) {
+    //     uint32_t curr_b_cols = min(b_cols, tile_width - k);
+    //     for (uint32_t i = 0; i < tile_height; i += a_rows) {
+    //         uint32_t curr_a_rows = min(a_rows, tile_height - i);
+    //         matmul_tile(
+    //             size_i, size_j, size_k,
+    //             a, b, c,
+    //             start_i + i, start_k + k,
+    //             curr_a_rows, curr_b_cols
+    //         );
+
+    //         // Need to wait for all threads to finish w/ what's in the SRAM
+    //         __syncthreads();
+    //     }
+    // }
 
     matmul_tile(
         size_i, size_j, size_k,
@@ -158,7 +183,7 @@ void launch_matmul_l1(
 
     // We want: a -> row major, b -> col major, c -> row major
     transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
-    transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Undo for testing
+    // transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Undo for testing
     // (b^T)^T = b added less than 1-2ms
 
     // Ideal would be a is row, b is col, and c is row
