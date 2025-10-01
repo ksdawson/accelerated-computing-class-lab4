@@ -49,9 +49,28 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
+// Helper to load/store data
+__device__ void copy_mem(float *src, float *dst, uint32_t buffer_width,
+    uint32_t n_rows, uint32_t start_i
+    ) {
+    // Copy data from one buffer to another
+    for (uint32_t thread_idx = threadIdx.x; thread_idx < n_rows * buffer_width; thread_idx += blockDim.x) {
+        // Get local idx
+        uint32_t i = thread_idx / buffer_width;
+        uint32_t j = thread_idx % buffer_width;
+        // Get dst idx
+        uint32_t dst_idx = i * buffer_width + j;
+        // Get src idx
+        uint32_t src_idx = (start_i + i) * buffer_width + j;
+        // Copy memory over
+        dst[dst_idx] = src[src_idx];
+    }
+    __syncthreads();
+}
+
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
-    float const *a, float const *b, float *c, // Matrices
+    float *a, float *b, float *c, // Matrices
     uint32_t start_i, uint32_t start_k, // Tile in c location
     uint32_t local_size_i, uint32_t local_size_k // Tile in c dimensions
     ) {
@@ -60,7 +79,8 @@ __device__ void matmul_tile(
     // Plan: Each thread works on one c_ik at a time
     
     // More than one thread may need to split a c_ik
-    uint32_t threads_per_c_ik = max(blockDim.x / (local_size_i * local_size_k), 1);
+    // uint32_t threads_per_c_ik = max(blockDim.x / (local_size_i * local_size_k), 1);
+    uint32_t threads_per_c_ik = 1;
     uint32_t start_idx = threadIdx.x / threads_per_c_ik;
     uint32_t end_idx = local_size_i * local_size_k;
     uint32_t step_size = blockDim.x / threads_per_c_ik;
@@ -69,8 +89,8 @@ __device__ void matmul_tile(
     // Iterate over c_ik's
     for (uint32_t idx = start_idx; idx < end_idx; idx += step_size) {
         // Get indices
-        uint32_t i = start_i + idx / local_size_k;
-        uint32_t k = start_k + idx % local_size_k;
+        uint32_t i = idx / local_size_k;
+        uint32_t k = idx % local_size_k;
         // Get local thread idx
         uint32_t local_idx = threadIdx.x % threads_per_c_ik;
         // Get j iteration bounds
@@ -80,20 +100,17 @@ __device__ void matmul_tile(
         float local_c_ik = 0.0f;
         // Iterate over a_i, b_k
         for (uint32_t j = start_j; j < end_j; ++j) {
-            local_c_ik += a[i * size_j + j] * b[j * size_k + k];
+            // local_c_ik += a[i * size_j + j] * b[j * size_k + k];
+            local_c_ik += a[i * size_j + j] * b[k * size_j + j];
         }
         // Write back to main memory at the end
-        c[i * size_k + k] += local_c_ik; // Might cause race conditions
+        c[(start_i + i) * size_k + (start_k + k)] += local_c_ik; // Might cause race conditions
     }
 }
 
 __global__ void matmul_l1(
-    int32_t size_i,
-    int32_t size_j,
-    int32_t size_k,
-    float const *a,
-    float const *b,
-    float *c) {
+    int32_t size_i, int32_t size_j, int32_t size_k,
+    float *a, float *b, float *c) {
     // Grid dimensions
     constexpr uint32_t tiles_per_row = 48; // Tuning parameter
     uint32_t tiles_per_col = gridDim.x / tiles_per_row;
@@ -121,12 +138,54 @@ __global__ void matmul_l1(
         ? tile_k * tile_width
         : extra_width * (tile_width + 1) + (tile_k - extra_width) * tile_width;
 
-    matmul_tile(
-        size_i, size_j, size_k,
-        a, b, c,
-        start_i, start_k,
-        tile_height, tile_width
-    );
+    // Load as many b cols saving space for at least one a row
+    uint32_t b_cols = min(tile_width, 25000 / size_j - 1);
+    // Load as many a rows with the remaining space
+    uint32_t a_rows = min(tile_height, 25000 / size_j - b_cols);
+
+    // Setup the block's SRAM
+    extern __shared__ float sram[];
+    float *local_a = sram;
+    float *local_b = sram + a_rows * size_j;
+
+    // Iterate over the tile because the whole tile might not fit into the SRAM
+    for (uint32_t k = 0; k < tile_width; k += b_cols) {
+        // Load b cols
+        uint32_t curr_b_cols = min(b_cols, tile_width - k);
+        copy_mem(b, local_b, size_j, curr_b_cols, start_k + k);
+
+        for (uint32_t i = 0; i < tile_height; i += a_rows) {
+            // Load a rows
+            uint32_t curr_a_rows = min(a_rows, tile_height - i);
+            copy_mem(a, local_a, size_j, curr_a_rows, start_i + i);
+
+            // Compute the subtile
+            matmul_tile(
+                size_i, size_j, size_k,
+                local_a, local_b, c,
+                start_i + i, start_k + k,
+                curr_a_rows, curr_b_cols
+            );
+
+            // Need to wait for all threads to finish w/ what's in the SRAM
+            __syncthreads();
+        }
+    }
+}
+
+__global__ void transpose_square_matrix(float *matrix, uint32_t n) {
+    uint32_t tot_threads = gridDim.x * blockDim.x;
+    uint32_t thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint32_t idx = thread_index; idx < n * n; idx += tot_threads) {
+        uint32_t i = idx / n;
+        uint32_t j = idx % n;
+        // Swap matrix[i][j] with matrix[j][i]
+        if (i < j) {
+            float temp = matrix[i * n + j];
+            matrix[i * n + j] = matrix[j * n + i];
+            matrix[j * n + i] = temp;
+        }
+    }
 }
 
 void launch_matmul_l1(
@@ -136,16 +195,24 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    // Optimization strategy:
-    // (1) a, b in L1 cache; c in registers
-    // (2) prefetch next tile into L2
-    // (3) transpose b
+    // We want: a -> row major, b -> col major, c -> row major
+    transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
 
-    // Ideal would be a is row, b is col, and c is row
-    // We might have to do it ourselves -> transpose b
-    // Part 2 lower bound: 17ms
-    matmul_l1<<<48, 32 * 32>>>(size_i, size_j, size_k, a, b, c);
+    // Setup the block SRAM
+    int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_l1,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes
+    ));
+
+    matmul_l1<<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, const_cast<float*>(a), const_cast<float*>(b), c);
 }
+// Part 2 lower bound: 17ms
+// Optimization strategy:
+// (1) a, b in L1 cache; c in registers
+// (2) prefetch next tile into L2
+// (3) transpose b
 
 }; // namespace matmul_l1
 
