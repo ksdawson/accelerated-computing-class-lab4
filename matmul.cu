@@ -49,16 +49,25 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
-__device__ void load_tile(uint32_t n_rows, uint32_t n_cols) {
-    for (uint32_t idx = threadIdx.x; idx < n_rows * n_cols; idx += blockDim.x) {
-        uint32_t i = idx / n_cols;
-        uint32_t j = idx % n_cols;
+__device__ void load_tile(
+    float const *src, uint32_t src_width, 
+    float *dst, uint32_t dst_height, uint32_t dst_width
+) {
+    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
+        // Get index to copy
+        uint32_t i = idx / dst_width;
+        uint32_t j = idx % dst_width;
+        // Copy mem over
+        dst[i * dst_width + j] = src[i * src_width + j];
     }
+    // Wait for all the memory to be copied
+    __syncthreads();
 }
 
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
     float const *a, float const *b, float *c, // Matrices
+    float *local_a, float *local_b, // Matrices in SRAM
     uint32_t n // Tile size
 ) {
     // Math: c_ik = a_i ⋅ b_k
@@ -72,9 +81,37 @@ __device__ void matmul_tile(
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
 
-    // Iterate over a_i, b_k
-    for (uint32_t j = 0; j < size_j; ++j) {
-        local_c_ik += a[i * size_j + j] * b[j * size_k + k];
+    uint32_t a_height = n;
+    uint32_t a_width = min(size_j, 390);
+    uint32_t b_height = min(size_j, 390);
+    uint32_t b_width = n;
+
+    // Iterate over subtiles of a_i, b_k
+    for (uint32_t idx = 0; idx < size_j; idx += a_width) {
+        // Update a_width, b_height
+        a_width = min(a_width, size_j - idx);
+        b_height = min(b_height, size_j - idx);
+
+        // Load subtiles
+        load_tile(
+            a, size_j,
+            local_a, a_height, a_width
+        );
+        load_tile(
+            b, size_k,
+            local_b, b_height, b_width
+        );
+
+        // Iterate over a_i, b_k
+        for (uint32_t j = 0; j < a_width; ++j) {
+            local_c_ik += local_a[i * a_width + j] * local_b[j * b_width + k];
+        }
+
+        // Move buffers
+        a += a_width;
+        b += b_height * size_k;
+
+        __syncthreads();
     }
 
     // Write back to main memory at the end
@@ -92,6 +129,11 @@ __global__ void matmul_l1(
     uint32_t tiles_per_row = size_k / n;
     uint32_t tiles_per_col = size_j / n;
 
+    // Setup the block's SRAM
+    extern __shared__ float sram[];
+    float *local_a = sram;
+    float *local_b = sram + 32 * min(size_j, 390); // 25000/(2*32) = 390
+
     // Iterate over tiles
     for (uint32_t idx = blockIdx.x; idx < tiles_per_col * tiles_per_row; idx += gridDim.x) {
         // Tile indices
@@ -108,6 +150,7 @@ __global__ void matmul_l1(
         matmul_tile(
             size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
+            local_a, local_b,
             n
         );
     }
@@ -120,7 +163,14 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    matmul_l1<<<48, 32 * 32>>>(size_i, size_j, size_k, a, b, c);
+    // Setup the block SRAM
+    int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_l1,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes
+    ));
+    matmul_l1<<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
 }
 
 // Part 2 lower bound: 17ms
