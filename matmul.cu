@@ -61,6 +61,7 @@ __device__ void load_buffer(
         // Copy mem over
         dst[i * dst_width + j] = src[i * src_width + j];
     }
+    __syncthreads();
 }
 
 __device__ void load_buffer_async(
@@ -75,6 +76,7 @@ __device__ void load_buffer_async(
         // Copy mem over
         __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
     }
+    __pipeline_commit();
 }
 
 __device__ void matmul_tile(
@@ -102,7 +104,6 @@ __device__ void matmul_tile(
     // Load compute buffer
     load_buffer(a, size_j, local_a, buffer_height, buffer_width);
     load_buffer(b, size_k, local_b, buffer_width, buffer_height);
-    __syncthreads();
 
     // Iterate over local buffers
     for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
@@ -113,7 +114,6 @@ __device__ void matmul_tile(
         // Load stage buffer
         load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
         load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
-        __pipeline_commit();
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
