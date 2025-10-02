@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -49,7 +51,7 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
-__device__ void load_tile(
+__device__ void load_buffer(
     float const *src, uint32_t src_width, 
     float *dst, uint32_t dst_height, uint32_t dst_width
 ) {
@@ -60,14 +62,47 @@ __device__ void load_tile(
         // Copy mem over
         dst[i * dst_width + j] = src[i * src_width + j];
     }
-    // Wait for all the memory to be copied
-    __syncthreads();
+}
+
+__device__ void load_buffer_async(
+    float const *src, uint32_t src_width, 
+    float *dst, uint32_t dst_height, uint32_t dst_width
+) {
+    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
+        // Get index to copy
+        uint32_t i = idx / dst_width;
+        uint32_t j = idx % dst_width;
+        // Copy mem over
+        // dst[i * dst_width + j] = src[i * src_width + j];
+        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::
+            "l"(&dst[i * dst_width + j]),
+            "l"(&src[i * src_width + j]),
+            "n"(sizeof(float))
+        );
+    }
+    asm volatile("cp.async.commit_group;\n");
+}
+
+__device__ void load_tile_async(
+    float const *src, uint32_t src_width,
+    float *dst, uint32_t dst_height, uint32_t dst_width
+) {
+    auto group = cooperative_groups::this_thread_block();
+    for (uint32_t i = 0; i < dst_height; i++) {
+        cooperative_groups::memcpy_async(
+            group,
+            &dst[i * dst_width],
+            &src[i * src_width],
+            dst_width * sizeof(float)
+        );
+    }
 }
 
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
     float const *a, float const *b, float *c, // Matrices
     float *local_a, float *local_b, // Matrices in SRAM
+    float *local_a_stage, float *local_b_stage, // Matrices in SRAM
     uint32_t n // Tile size
 ) {
     // Math: c_ik = a_i ⋅ b_k
@@ -81,37 +116,41 @@ __device__ void matmul_tile(
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
 
-    uint32_t a_height = n;
-    uint32_t a_width = min(size_j, 390);
-    uint32_t b_height = min(size_j, 390);
-    uint32_t b_width = n;
+    // Double buffer dimensions
+    uint32_t buffer_height = n;
+    uint32_t buffer_width = min(size_j, 384)/2;
 
-    // Iterate over subtiles of a_i, b_k
-    for (uint32_t idx = 0; idx < size_j; idx += a_width) {
-        // Update a_width, b_height
-        a_width = min(a_width, size_j - idx);
-        b_height = min(b_height, size_j - idx);
+    // Load compute buffer
+    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
+    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+    __syncthreads();
 
-        // Load subtiles
-        load_tile(
-            a, size_j,
-            local_a, a_height, a_width
-        );
-        load_tile(
-            b, size_k,
-            local_b, b_height, b_width
-        );
+    // Iterate over local buffers
+    for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
+        // Move global buffers
+        a += buffer_width;
+        b += buffer_width * size_k;
+
+        // Load stage buffer
+        // load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        // load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        load_buffer(a, size_j, local_a_stage, buffer_height, buffer_width);
+        load_buffer(b, size_k, local_b_stage, buffer_width, buffer_height);
 
         // Iterate over a_i, b_k
-        for (uint32_t j = 0; j < a_width; ++j) {
-            local_c_ik += local_a[i * a_width + j] * local_b[j * b_width + k];
+        for (uint32_t j = 0; j < buffer_width; ++j) {
+            local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
         }
 
-        // Move buffers
-        a += a_width;
-        b += b_height * size_k;
-
+        // Swap double buffers
         __syncthreads();
+        // asm volatile("cp.async.wait_group 0;\n");
+        std::swap(local_a, local_a_stage);
+        std::swap(local_b, local_b_stage);
+    }
+    // Process last block
+    for (uint32_t j = 0; j < buffer_width; ++j) {
+        local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
     }
 
     // Write back to main memory at the end
@@ -131,8 +170,12 @@ __global__ void matmul_l1(
 
     // Setup the block's SRAM
     extern __shared__ float sram[];
+    // Split the SRAM into a double buffer
+    uint32_t double_buffer_size = 32 * min(size_j, 384)/2; // 25000/(2*32) = 390
     float *local_a = sram;
-    float *local_b = sram + 32 * min(size_j, 390); // 25000/(2*32) = 390
+    float *local_a_stage = local_a + double_buffer_size;
+    float *local_b = local_a_stage + double_buffer_size;
+    float *local_b_stage = local_b + double_buffer_size;
 
     // Iterate over tiles
     for (uint32_t idx = blockIdx.x; idx < tiles_per_col * tiles_per_row; idx += gridDim.x) {
@@ -151,6 +194,7 @@ __global__ void matmul_l1(
             size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
             local_a, local_b,
+            local_a_stage, local_b_stage,
             n
         );
     }
