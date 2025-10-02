@@ -101,20 +101,20 @@ __device__ void matmul_tile(
     uint32_t buffer_height = n;
     uint32_t buffer_width = min(size_j, 384)/2;
 
-    // Load stage buffer
-    load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-    load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
-
-    // Move global buffers
-    a += buffer_width;
-    b += buffer_width * size_k;
-
     // Load compute buffer
     load_buffer(a, size_j, local_a, buffer_height, buffer_width);
     load_buffer(b, size_k, local_b, buffer_width, buffer_height);
 
     // Iterate over local buffers
-    for (uint32_t idx = 0; idx < size_j / buffer_width - 2; ++idx) {
+    for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
+        // Move global buffers
+        a += buffer_width;
+        b += buffer_width * size_k;
+
+        // Load stage buffer
+        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
             local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
@@ -125,27 +125,11 @@ __device__ void matmul_tile(
         __pipeline_wait_prior(0);
         std::swap(local_a, local_a_stage);
         std::swap(local_b, local_b_stage);
-
-        // Move global buffers
-        a += buffer_width;
-        b += buffer_width * size_k;
-
-        // Load stage buffer
-        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
     }
-    // Process two blocks
+    // Process last block
     for (uint32_t j = 0; j < buffer_width; ++j) {
         local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
     }
-    __syncthreads();
-    __pipeline_wait_prior(0);
-    std::swap(local_a, local_a_stage);
-    std::swap(local_b, local_b_stage);
-    for (uint32_t j = 0; j < buffer_width; ++j) {
-        local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
-    }
-    __syncthreads();
 
     // Write back to main memory at the end
     c[i * size_k + k] = local_c_ik;
