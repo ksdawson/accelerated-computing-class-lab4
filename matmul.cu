@@ -2,8 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/memcpy_async.h>
+#include <cuda_pipeline_primitives.h>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -68,33 +67,13 @@ __device__ void load_buffer_async(
     float const *src, uint32_t src_width, 
     float *dst, uint32_t dst_height, uint32_t dst_width
 ) {
-    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
+    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width / 4; idx += blockDim.x) {
         // Get index to copy
-        uint32_t i = idx / dst_width;
-        uint32_t j = idx % dst_width;
+        uint32_t flat_idx = idx * 4;
+        uint32_t i = flat_idx / dst_width;
+        uint32_t j = flat_idx % dst_width;
         // Copy mem over
-        // dst[i * dst_width + j] = src[i * src_width + j];
-        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::
-            "l"(&dst[i * dst_width + j]),
-            "l"(&src[i * src_width + j]),
-            "n"(sizeof(float))
-        );
-    }
-    asm volatile("cp.async.commit_group;\n");
-}
-
-__device__ void load_tile_async(
-    float const *src, uint32_t src_width,
-    float *dst, uint32_t dst_height, uint32_t dst_width
-) {
-    auto group = cooperative_groups::this_thread_block();
-    for (uint32_t i = 0; i < dst_height; i++) {
-        cooperative_groups::memcpy_async(
-            group,
-            &dst[i * dst_width],
-            &src[i * src_width],
-            dst_width * sizeof(float)
-        );
+        __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
     }
 }
 
@@ -132,10 +111,9 @@ __device__ void matmul_tile(
         b += buffer_width * size_k;
 
         // Load stage buffer
-        // load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        // load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
-        load_buffer(a, size_j, local_a_stage, buffer_height, buffer_width);
-        load_buffer(b, size_k, local_b_stage, buffer_width, buffer_height);
+        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        __pipeline_commit();
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
@@ -144,7 +122,7 @@ __device__ void matmul_tile(
 
         // Swap double buffers
         __syncthreads();
-        // asm volatile("cp.async.wait_group 0;\n");
+        __pipeline_wait_prior(0);
         std::swap(local_a, local_a_stage);
         std::swap(local_b, local_b_stage);
     }
