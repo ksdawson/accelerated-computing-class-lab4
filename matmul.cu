@@ -95,48 +95,38 @@ __device__ void matmul_tile(
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
 
-    // Prefetch 0-10 subtiles
-    for (uint32_t pipe_stage = 0; pipe_stage < 11; ++pipe_stage) {
-        // Each thread prefetches a float from a,b
-        __pipeline_memcpy_async(&local_a[pipe_stage][i * n + k], &a[i * size_j + k], sizeof(float), 0);
-        __pipeline_memcpy_async(&local_b[pipe_stage][i * n + k], &b[i * size_k + k], sizeof(float), 0);
-        // Move global buffers
-        a += n;
-        b += n * size_k;
-    }
-    __pipeline_commit();
-
-    // Load 11th subtile
-    local_a[11][i * n + k] = a[i * size_j + k];
-    local_b[11][i * n + k] = b[i * size_k + k];
+    // Load first subtile
+    local_a[0][i * n + k] = a[i * size_j + k];
+    local_b[0][i * n + k] = b[i * size_k + k];
     __syncthreads();
 
     // Iterate over a,b subtiles
-    for (uint32_t pipe_stage = 11; pipe_stage < size_j / n; ++pipe_stage) {
-        // Iterate over a_i, b_k
-        for (uint32_t j = 0; j < n; ++j) {
-            local_c_ik += local_a[pipe_stage % 12][i * n + j] * local_b[pipe_stage % 12][j * n + k];
-        }
-
-        // Advance to the next stage
-        __syncthreads();
-        __pipeline_wait_prior(0);
+    for (uint32_t pipe_idx = 0; pipe_idx < size_j / n - 1; ++pipe_idx) {
+        // Pipe stages
+        uint32_t pipe_stage = pipe_idx % 12;
+        uint32_t next_pipe_stage = (pipe_idx + 1) % 12;
 
         // Move global buffers
         a += n;
         b += n * size_k;
 
         // Prefetch next subtile
-        __pipeline_memcpy_async(&local_a[pipe_stage % 12][i * n + k], &a[i * size_j + k], sizeof(float), 0);
-        __pipeline_memcpy_async(&local_b[pipe_stage % 12][i * n + k], &b[i * size_k + k], sizeof(float), 0);
+        __pipeline_memcpy_async(&local_a[next_pipe_stage][i * n + k], &a[i * size_j + k], sizeof(float), 0);
+        __pipeline_memcpy_async(&local_b[next_pipe_stage][i * n + k], &b[i * size_k + k], sizeof(float), 0);
         __pipeline_commit();
-    }
-    // Process last 11 preloaded subtiles
-    for (uint32_t pipe_stage = size_j / n; pipe_stage < size_j / n + 11; ++pipe_stage) {
+
+        // Iterate over a_i, b_k
         for (uint32_t j = 0; j < n; ++j) {
-            local_c_ik += local_a[pipe_stage % 12][i * n + j] * local_b[pipe_stage % 12][j * n + k];
+            local_c_ik += local_a[pipe_stage][i * n + j] * local_b[pipe_stage][j * n + k];
         }
+
+        // Advance to the next stage
+        __syncthreads();
         __pipeline_wait_prior(0);
+    }
+    uint32_t last_pipe_stage = (size_j / n - 1) % 12;
+    for (uint32_t j = 0; j < n; ++j) {
+        local_c_ik += local_a[last_pipe_stage][i * n + j] * local_b[last_pipe_stage][j * n + k];
     }
 
     // Write back to main memory at the end
