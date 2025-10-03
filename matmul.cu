@@ -87,6 +87,7 @@ __device__ void matmul_tile(
     // Math: c_ik = a_i ⋅ b_k
     // Goal: c_ik in registers and a_i, b_k in L1 cache
     // Plan: Each thread works on one c_ik at a time
+    const uint32_t pipe_depth = 8;
 
     // Each thread gets a c_ik
     uint32_t i = threadIdx.x / n;
@@ -95,38 +96,49 @@ __device__ void matmul_tile(
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
 
-    // Load first subtile
-    local_a[0][i * n + k] = a[i * size_j + k];
-    local_b[0][i * n + k] = b[i * size_k + k];
-    __syncthreads();
-
-    // Iterate over a,b subtiles
-    for (uint32_t pipe_idx = 0; pipe_idx < size_j / n - 1; ++pipe_idx) {
-        // Pipe stages
-        uint32_t pipe_stage = pipe_idx % 12;
-        uint32_t next_pipe_stage = (pipe_idx + 1) % 12;
-
+    // Prefill the pipeline
+    for (uint32_t pipe_stage = 0; pipe_stage < pipe_depth; ++pipe_stage) {
+        // Prefetch next subtile
+        __pipeline_memcpy_async(&local_a[pipe_stage][i * n + k], &a[i * size_j + k], sizeof(float), 0);
+        __pipeline_memcpy_async(&local_b[pipe_stage][i * n + k], &b[i * size_k + k], sizeof(float), 0);
+        __pipeline_commit();
         // Move global buffers
         a += n;
         b += n * size_k;
+    }
+    // Wait until queue is fully populated
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    // Iterate over a,b subtiles
+    for (uint32_t pipe_idx = 0; pipe_idx < size_j / n - pipe_depth; ++pipe_idx) {
+        // Pipe stages
+        uint32_t pipe_stage = pipe_idx % 12;
+        uint32_t next_pipe_stage = (pipe_idx + pipe_depth) % 12;
 
         // Prefetch next subtile
         __pipeline_memcpy_async(&local_a[next_pipe_stage][i * n + k], &a[i * size_j + k], sizeof(float), 0);
         __pipeline_memcpy_async(&local_b[next_pipe_stage][i * n + k], &b[i * size_k + k], sizeof(float), 0);
         __pipeline_commit();
 
+        // Move global buffers
+        a += n;
+        b += n * size_k;
+
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < n; ++j) {
             local_c_ik += local_a[pipe_stage][i * n + j] * local_b[pipe_stage][j * n + k];
         }
-
-        // Advance to the next stage
         __syncthreads();
-        __pipeline_wait_prior(0);
     }
-    uint32_t last_pipe_stage = (size_j / n - 1) % 12;
-    for (uint32_t j = 0; j < n; ++j) {
-        local_c_ik += local_a[last_pipe_stage][i * n + j] * local_b[last_pipe_stage][j * n + k];
+    // Process the last of the pipeline
+    uint32_t last_pipe_idx = size_j / n - pipe_depth;
+    #pragma unroll
+    for (uint32_t pipe_idx = 0; pipe_idx < pipe_depth; ++pipe_idx) {
+        uint32_t pipe_stage = (last_pipe_idx + pipe_idx) % 12;
+        for (uint32_t j = 0; j < n; ++j) {
+            local_c_ik += local_a[pipe_stage][i * n + j] * local_b[pipe_stage][j * n + k];
+        }
     }
 
     // Write back to main memory at the end
