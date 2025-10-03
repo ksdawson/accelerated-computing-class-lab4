@@ -127,20 +127,20 @@ __device__ void matmul_tile(
 
     // Load compute buffer
     load_buffer(a, size_j, local_a, buffer_height, buffer_width);
-    // load_buffer(b, size_k, local_b, buffer_width, buffer_height);
-    load_buffer_transpose(b, size_k, local_b, buffer_height, buffer_width);
+    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+    // load_buffer_transpose(b, size_k, local_b, buffer_height, buffer_width); // used if b is row major
 
     // Iterate over local buffers
     for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
         // Move global buffers
         a += buffer_width;
-        // b += buffer_width * size_k;
-        b += buffer_width;
+        b += buffer_width * size_k;
+        // b += buffer_width; // used if b is row major
 
         // Load stage buffer
         load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        // load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
-        load_buffer_transpose_async(b, size_k, local_b_stage, buffer_height, buffer_width);
+        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        // load_buffer_transpose_async(b, size_k, local_b_stage, buffer_height, buffer_width); // used if b is row major
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
@@ -206,8 +206,8 @@ __global__ void matmul_l1(
 
         // Move buffers
         float const *tile_a = a + tile_i * n * size_j;
-        // float const *tile_b = b + tile_k * n;
-        float const *tile_b = b + tile_k * n * size_j;
+        float const *tile_b = b + tile_k * n;
+        // float const *tile_b = b + tile_k * n * size_j; // used if b is row major
         float *tile_c = c + tile_i * n * size_j + tile_k * n;
 
         matmul_tile(
@@ -243,7 +243,7 @@ void launch_matmul_l1(
     float const *b,
     float *c) {
     // We want: a -> row major, b -> col major, c -> row major
-    transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
+    // transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
 
     // Setup the block SRAM
     int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
