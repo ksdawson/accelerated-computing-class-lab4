@@ -48,8 +48,6 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem)
 
-namespace matmul_l1 {
-
 __device__ void load_buffer(
     float const *src, uint32_t src_width, 
     float *dst, uint32_t dst_height, uint32_t dst_width
@@ -77,6 +75,8 @@ __device__ void load_buffer_async(
     }
     __pipeline_commit();
 }
+
+namespace matmul_l1 {
 
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
@@ -203,14 +203,109 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+__device__ void matmul_l1_reg_tile(
+    uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
+    float const *a, float const *b, float *c, // Matrices
+    float *local_a, float *local_b, // Matrices in SRAM
+    float *local_a_stage, float *local_b_stage, // Matrices in SRAM
+    uint32_t n // Tile size
+) {
+    // Each thread gets a c_ik block
+    uint32_t block_n = n / 32;
+    uint32_t start_i = (threadIdx.x / n) * block_n;
+    uint32_t start_k = (threadIdx.x % n) * block_n;
+
+    // Keep c_ik's in local registers
+    float local_c_ik[36] = {0.0f}; // max of 36
+
+    // Double buffer dimensions
+    uint32_t buffer_height = n;
+    uint32_t buffer_width = ((25000 / (4 * n)) / 32) * 32;
+
+    // Load compute buffer
+    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
+    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+
+    // Iterate over local buffers
+    for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
+        // Move global buffers
+        a += buffer_width;
+        b += buffer_width * size_k;
+
+        // Load stage buffer
+        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+
+        // Iterate over thread c_ik's
+        for (uint32_t c_ik_idx = 0; c_ik_idx < block_n * block_n; ++c_ik_idx) {
+            // Calculate i,k
+            uint32_t i = start_i + c_ik_idx / block_n;
+            uint32_t k = start_k + c_ik_idx % block_n;
+            // Iterate over a_i, b_k
+            for (uint32_t j = 0; j < buffer_width; ++j) {
+                local_c_ik[c_ik_idx] += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+            }
+        }
+
+        // Swap double buffers
+        __syncthreads();
+        __pipeline_wait_prior(0);
+        std::swap(local_a, local_a_stage);
+        std::swap(local_b, local_b_stage);
+    }
+    // Process last block
+    for (uint32_t c_ik_idx = 0; c_ik_idx < block_n * block_n; ++c_ik_idx) {
+        uint32_t i = start_i + c_ik_idx / block_n;
+        uint32_t k = start_k + c_ik_idx % block_n;
+        for (uint32_t j = 0; j < buffer_width; ++j) {
+            local_c_ik[c_ik_idx] += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+        }
+        // Write back to main memory at the end
+        c[i * size_k + k] = local_c_ik[c_ik_idx];
+    }
+}
+
 __global__ void matmul_l1_reg(
-    int32_t size_i,
-    int32_t size_j,
-    int32_t size_k,
-    float const *a,
-    float const *b,
-    float *c) {
-    /* TODO: your GPU code here */
+    int32_t size_i, int32_t size_j, int32_t size_k,
+    float const *a,  float const *b, float *c,
+    uint32_t block_n
+) {
+    // c_ik tile dimensions
+    uint32_t n = 32 * block_n; // square multiples of 32
+
+    // Grid dimensions
+    uint32_t tiles_per_row = size_k / n;
+    uint32_t tiles_per_col = size_j / n;
+
+    // Setup the block's SRAM
+    extern __shared__ float sram[];
+    // Split the SRAM into a double buffer
+    uint32_t j_per_row = ((25000 / (4 * n)) / 32) * 32; // max 25000 floats, 4 buffers of n rows, want to be a multiple of 32
+    uint32_t double_buffer_size = n * j_per_row;
+    float *local_a = sram;
+    float *local_a_stage = local_a + double_buffer_size;
+    float *local_b = local_a_stage + double_buffer_size;
+    float *local_b_stage = local_b + double_buffer_size;
+
+    // Iterate over tiles
+    for (uint32_t idx = blockIdx.x; idx < tiles_per_col * tiles_per_row; idx += gridDim.x) {
+        // Tile indices
+        // uint32_t tile_i = idx / tiles_per_row; // Row major
+        // uint32_t tile_k = idx % tiles_per_row;
+        uint32_t tile_k = idx / tiles_per_col; // Col major
+        uint32_t tile_i = idx % tiles_per_col;
+
+        // Move buffers
+        float const *tile_a = a + tile_i * n * size_j;
+        float const *tile_b = b + tile_k * n;
+        float *tile_c = c + tile_i * n * size_j + tile_k * n;
+
+        matmul_l1_reg_tile( size_i, size_j, size_k,
+            tile_a, tile_b, tile_c,
+            local_a, local_b, local_a_stage, local_b_stage,
+            n
+        );
+    }
 }
 
 void launch_matmul_l1_reg(
@@ -220,8 +315,19 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
-    // Lower bound: 5ms
+    // uint32_t c_ik_per_thread = (size_i * size_k) / (48 * 1024); 
+    // c_ik_per_thread = 
+
+    // Setup the block SRAM
+    int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_l1_reg,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes
+    ));
+    // uint32_t block_n = size_i == 3072 ? 6 : 1; // 36 c_ik's per thread in the large matrix
+    uint32_t block_n = 1;
+    matmul_l1_reg<<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c, block_n);
 }
 
 }; // namespace matmul_l1_reg
