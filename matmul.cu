@@ -81,9 +81,8 @@ __device__ void load_buffer_async(
 __device__ void matmul_tile(
     uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
     float const *a, float const *b, float *c, // Matrices
-    float *local_a, float *local_b, // Matrices in SRAM
-    float *local_a_stage, float *local_b_stage, // Matrices in SRAM
-    uint32_t n // Tile size
+    float **local_a, float **local_b, // a,b subtile queue in SRAM
+    uint32_t n // c_ik tile size
 ) {
     // Math: c_ik = a_i ⋅ b_k
     // Goal: c_ik in registers and a_i, b_k in L1 cache
@@ -96,56 +95,52 @@ __device__ void matmul_tile(
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
 
-    // Double buffer dimensions
-    uint32_t buffer_height = n;
-    uint32_t buffer_width = min(size_j, 384)/2;
-
-    // Load compute buffer
-    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
-    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
-
-    // Iterate over local buffers
-    for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
+    // Prefetch 0-10 subtiles
+    for (uint32_t pipe_stage = 0; pipe_stage < 11; ++pipe_stage) {
+        // Each thread prefetches a float from a,b
+        __pipeline_memcpy_async(&local_a[pipe_stage][i * n + k], &a[i * size_j + k], sizeof(float), 0);
+        __pipeline_memcpy_async(&local_b[pipe_stage][i * n + k], &b[i * size_k + k], sizeof(float), 0);
         // Move global buffers
-        a += buffer_width;
-        b += buffer_width * size_k;
+        a += n;
+        b += n * size_k;
+    }
+    __pipeline_commit();
 
-        // Load stage buffer
-        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+    // Load 11th subtile
+    local_a[11][i * n + k] = a[i * size_j + k];
+    local_b[11][i * n + k] = b[i * size_k + k];
+    __syncthreads();
 
+    // Iterate over a,b subtiles
+    for (uint32_t pipe_stage = 11; pipe_stage < size_j / n; ++pipe_stage) {
         // Iterate over a_i, b_k
-        for (uint32_t j = 0; j < buffer_width; ++j) {
-            local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+        for (uint32_t j = 0; j < n; ++j) {
+            local_c_ik += local_a[pipe_stage % 12][i * n + j] * local_b[pipe_stage % 12][j * n + k];
         }
 
-        // Swap double buffers
+        // Advance to the next stage
         __syncthreads();
         __pipeline_wait_prior(0);
-        std::swap(local_a, local_a_stage);
-        std::swap(local_b, local_b_stage);
+
+        // Move global buffers
+        a += n;
+        b += n * size_k;
+
+        // Prefetch next subtile
+        __pipeline_memcpy_async(&local_a[pipe_stage % 12][i * n + k], &a[i * size_j + k], sizeof(float), 0);
+        __pipeline_memcpy_async(&local_b[pipe_stage % 12][i * n + k], &b[i * size_k + k], sizeof(float), 0);
+        __pipeline_commit();
     }
-    // Process last block
-    for (uint32_t j = 0; j < buffer_width; ++j) {
-        local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+    // Process last 11 preloaded subtiles
+    for (uint32_t pipe_stage = size_j / n; pipe_stage < size_j / n + 11; ++pipe_stage) {
+        for (uint32_t j = 0; j < n; ++j) {
+            local_c_ik += local_a[pipe_stage % 12][i * n + j] * local_b[pipe_stage % 12][j * n + k];
+        }
+        __pipeline_wait_prior(0);
     }
 
     // Write back to main memory at the end
     c[i * size_k + k] = local_c_ik;
-}
-
-__device__ void prefetch_next_tile(
-    float const *src, uint32_t src_width, 
-    uint32_t dst_height, uint32_t dst_width
-) {
-    uint32_t stride = 32; // 128b cache line size -> 32 floats
-    for (uint32_t idx = threadIdx.x * stride; idx < dst_height * dst_width; idx += blockDim.x * stride) {
-        // Get index to copy
-        uint32_t i = idx / dst_width;
-        uint32_t j = idx % dst_width;
-        // Prefetch from main memory to L2 cache
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(&src[i * src_width + j]));
-    }
 }
 
 __global__ void matmul_l1(
@@ -159,14 +154,23 @@ __global__ void matmul_l1(
     uint32_t tiles_per_row = size_k / n;
     uint32_t tiles_per_col = size_j / n;
 
-    // Setup the block's SRAM
-    extern __shared__ float sram[];
-    // Split the SRAM into a double buffer
-    uint32_t double_buffer_size = 32 * min(size_j, 384)/2; // 25000/(2*32) = 390
-    float *local_a = sram;
-    float *local_a_stage = local_a + double_buffer_size;
-    float *local_b = local_a_stage + double_buffer_size;
-    float *local_b_stage = local_b + double_buffer_size;
+    // Setup sram
+    extern __shared__ float sram[]; // 2 tiles * 12 subtiles * 32 rows * 32 cols = 24576 floats
+
+    // Create queues of subtiles for a and b in sram
+    float *start = sram;
+    float *local_a[12];
+    float *local_b[12];
+    for (uint32_t i = 0; i < 12; ++i) {
+        // Create subtiles
+        float *local_sub_a = start;
+        float *local_sub_b = start + 1024;
+        // Add to our queue
+        local_a[i] = local_sub_a;
+        local_b[i] = local_sub_b;
+        // Advance the sram pointer
+        start += 2048;
+    }
 
     // Iterate over tiles
     for (uint32_t idx = blockIdx.x; idx < tiles_per_col * tiles_per_row; idx += gridDim.x) {
@@ -181,28 +185,12 @@ __global__ void matmul_l1(
         float const *tile_b = b + tile_k * n;
         float *tile_c = c + tile_i * n * size_j + tile_k * n;
 
+        // Compute the c_ik tile
         matmul_tile(
             size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
-            local_a, local_b,
-            local_a_stage, local_b_stage,
-            n
+            local_a, local_b, n
         );
-    }
-}
-
-__global__ void transpose_square_matrix(float *matrix, uint32_t n) {
-    uint32_t tot_threads = gridDim.x * blockDim.x;
-    uint32_t thread_index = blockIdx.x * blockDim.x + threadIdx.x;
-    for (uint32_t idx = thread_index; idx < n * n; idx += tot_threads) {
-        uint32_t i = idx / n;
-        uint32_t j = idx % n;
-        // Swap matrix[i][j] with matrix[j][i]
-        if (i < j) {
-            float temp = matrix[i * n + j];
-            matrix[i * n + j] = matrix[j * n + i];
-            matrix[j * n + i] = temp;
-        }
     }
 }
 
@@ -213,11 +201,8 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    // We want: a -> row major, b -> col major, c -> row major
-    // transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
-
     // Setup the block SRAM
-    int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
+    int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
     CUDA_CHECK(cudaFuncSetAttribute(
         matmul_l1,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
