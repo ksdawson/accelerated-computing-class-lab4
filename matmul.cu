@@ -115,8 +115,12 @@ __device__ void matmul_tile(
     // Plan: Each thread works on one c_ik at a time
 
     // Each thread gets a c_ik
-    uint32_t i = threadIdx.x / n;
-    uint32_t k = threadIdx.x % n;
+    // uint32_t i = threadIdx.x / n;
+    // uint32_t k = threadIdx.x % n;
+    uint32_t warp = threadIdx.x / 32;
+    uint32_t thread = threadIdx.x % 32;
+    uint32_t i = thread;
+    uint32_t k = (warp + thread) % 32;
 
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
@@ -126,7 +130,8 @@ __device__ void matmul_tile(
     uint32_t buffer_width = min(size_j, 384)/2;
 
     // Load compute buffer
-    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
+    load_buffer_transpose(a, size_j, local_a, buffer_height, buffer_width);
+    // load_buffer(a, size_j, local_a, buffer_height, buffer_width);
     load_buffer(b, size_k, local_b, buffer_width, buffer_height);
     // load_buffer_transpose(b, size_k, local_b, buffer_height, buffer_width); // used if b is row major
 
@@ -138,13 +143,15 @@ __device__ void matmul_tile(
         // b += buffer_width; // used if b is row major
 
         // Load stage buffer
-        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        load_buffer_transpose_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        // load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
         load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
         // load_buffer_transpose_async(b, size_k, local_b_stage, buffer_height, buffer_width); // used if b is row major
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
-            local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+            // local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+            local_c_ik += local_a[j * buffer_height + i] * local_b[j * buffer_height + k];
         }
 
         // Swap double buffers
@@ -155,7 +162,8 @@ __device__ void matmul_tile(
     }
     // Process last block
     for (uint32_t j = 0; j < buffer_width; ++j) {
-        local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+        // local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+        local_c_ik += local_a[j * buffer_height + i] * local_b[j * buffer_height + k];
     }
 
     // Write back to main memory at the end
