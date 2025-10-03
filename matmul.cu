@@ -134,20 +134,6 @@ __device__ void matmul_tile(
     c[i * size_k + k] = local_c_ik;
 }
 
-__device__ void prefetch_next_tile(
-    float const *src, uint32_t src_width, 
-    uint32_t dst_height, uint32_t dst_width
-) {
-    uint32_t stride = 32; // 128b cache line size -> 32 floats
-    for (uint32_t idx = threadIdx.x * stride; idx < dst_height * dst_width; idx += blockDim.x * stride) {
-        // Get index to copy
-        uint32_t i = idx / dst_width;
-        uint32_t j = idx % dst_width;
-        // Prefetch from main memory to L2 cache
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(&src[i * src_width + j]));
-    }
-}
-
 __global__ void matmul_l1(
     int32_t size_i, int32_t size_j, int32_t size_k,
     float const *a, float const *b, float *c
@@ -191,21 +177,6 @@ __global__ void matmul_l1(
     }
 }
 
-__global__ void transpose_square_matrix(float *matrix, uint32_t n) {
-    uint32_t tot_threads = gridDim.x * blockDim.x;
-    uint32_t thread_index = blockIdx.x * blockDim.x + threadIdx.x;
-    for (uint32_t idx = thread_index; idx < n * n; idx += tot_threads) {
-        uint32_t i = idx / n;
-        uint32_t j = idx % n;
-        // Swap matrix[i][j] with matrix[j][i]
-        if (i < j) {
-            float temp = matrix[i * n + j];
-            matrix[i * n + j] = matrix[j * n + i];
-            matrix[j * n + i] = temp;
-        }
-    }
-}
-
 void launch_matmul_l1(
     int32_t size_i,
     int32_t size_j,
@@ -213,11 +184,8 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    // We want: a -> row major, b -> col major, c -> row major
-    // transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
-
     // Setup the block SRAM
-    int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
+    int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
     CUDA_CHECK(cudaFuncSetAttribute(
         matmul_l1,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
