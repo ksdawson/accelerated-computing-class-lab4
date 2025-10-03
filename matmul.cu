@@ -63,20 +63,6 @@ __device__ void load_buffer(
     }
     __syncthreads();
 }
-__device__ void load_buffer_transpose(
-    float const *src, uint32_t src_width, 
-    float *dst, uint32_t dst_height, uint32_t dst_width
-) {
-    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
-        // Get index to copy
-        uint32_t i = idx / dst_width;
-        uint32_t j = idx % dst_width;
-        // Transpose while copying: dst[j * dst_height + i] = src[i * src_width + j];
-        dst[j * dst_height + i] = src[i * src_width + j];
-    }
-    __syncthreads();
-}
-
 __device__ void load_buffer_async(
     float const *src, uint32_t src_width, 
     float *dst, uint32_t dst_height, uint32_t dst_width
@@ -88,17 +74,6 @@ __device__ void load_buffer_async(
         uint32_t j = flat_idx % dst_width;
         // Copy mem over
         __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
-    }
-    __pipeline_commit();
-}
-__device__ void load_buffer_transpose_async(
-    float const *src, uint32_t src_width, 
-    float *dst, uint32_t dst_height, uint32_t dst_width
-) {
-    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
-        uint32_t i = idx / dst_width;
-        uint32_t j = idx % dst_width;
-        __pipeline_memcpy_async(&dst[j * dst_height + i], &src[i * src_width + j], sizeof(float), 0);
     }
     __pipeline_commit();
 }
@@ -115,12 +90,8 @@ __device__ void matmul_tile(
     // Plan: Each thread works on one c_ik at a time
 
     // Each thread gets a c_ik
-    // uint32_t i = threadIdx.x / n;
-    // uint32_t k = threadIdx.x % n;
-    uint32_t warp = threadIdx.x / 32;
-    uint32_t thread = threadIdx.x % 32;
-    uint32_t i = thread;
-    uint32_t k = (warp + thread) % 32;
+    uint32_t i = threadIdx.x / n;
+    uint32_t k = threadIdx.x % n;
 
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
@@ -130,28 +101,22 @@ __device__ void matmul_tile(
     uint32_t buffer_width = min(size_j, 384)/2;
 
     // Load compute buffer
-    load_buffer_transpose(a, size_j, local_a, buffer_height, buffer_width);
-    // load_buffer(a, size_j, local_a, buffer_height, buffer_width);
+    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
     load_buffer(b, size_k, local_b, buffer_width, buffer_height);
-    // load_buffer_transpose(b, size_k, local_b, buffer_height, buffer_width); // used if b is row major
 
     // Iterate over local buffers
     for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
         // Move global buffers
         a += buffer_width;
         b += buffer_width * size_k;
-        // b += buffer_width; // used if b is row major
 
         // Load stage buffer
-        load_buffer_transpose_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        // load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
+        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
         load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
-        // load_buffer_transpose_async(b, size_k, local_b_stage, buffer_height, buffer_width); // used if b is row major
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
-            // local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
-            local_c_ik += local_a[j * buffer_height + i] * local_b[j * buffer_height + k];
+            local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
         }
 
         // Swap double buffers
@@ -162,8 +127,7 @@ __device__ void matmul_tile(
     }
     // Process last block
     for (uint32_t j = 0; j < buffer_width; ++j) {
-        // local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
-        local_c_ik += local_a[j * buffer_height + i] * local_b[j * buffer_height + k];
+        local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
     }
 
     // Write back to main memory at the end
@@ -215,7 +179,6 @@ __global__ void matmul_l1(
         // Move buffers
         float const *tile_a = a + tile_i * n * size_j;
         float const *tile_b = b + tile_k * n;
-        // float const *tile_b = b + tile_k * n * size_j; // used if b is row major
         float *tile_c = c + tile_i * n * size_j + tile_k * n;
 
         matmul_tile(
