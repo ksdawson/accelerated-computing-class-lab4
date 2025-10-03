@@ -50,12 +50,12 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 __device__ void load_buffer(
     float const *src, uint32_t src_width, 
-    float *dst, uint32_t dst_height, uint32_t dst_width
+    float *dst, const uint32_t dst_height, const uint32_t dst_width
 ) {
     for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
         // Get index to copy
-        uint32_t i = idx / dst_width;
-        uint32_t j = idx % dst_width;
+        const uint32_t i = idx / dst_width;
+        const uint32_t j = idx % dst_width;
         // Copy mem over
         dst[i * dst_width + j] = src[i * src_width + j];
     }
@@ -63,13 +63,13 @@ __device__ void load_buffer(
 }
 __device__ void load_buffer_async(
     float const *src, uint32_t src_width, 
-    float *dst, uint32_t dst_height, uint32_t dst_width
+    float *dst, const uint32_t dst_height, const uint32_t dst_width
 ) {
     for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width / 4; idx += blockDim.x) {
         // Get index to copy
-        uint32_t flat_idx = idx * 4;
-        uint32_t i = flat_idx / dst_width;
-        uint32_t j = flat_idx % dst_width;
+        const uint32_t flat_idx = idx * 4;
+        const uint32_t i = flat_idx / dst_width;
+        const uint32_t j = flat_idx % dst_width;
         // Copy mem over
         __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
     }
@@ -79,44 +79,39 @@ __device__ void load_buffer_async(
 namespace matmul_l1 {
 
 __device__ void matmul_tile(
-    uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
-    float const *a, float const *b, float *c, // Matrices
-    float *local_a, float *local_b, // Matrices in SRAM
-    float *local_a_stage, float *local_b_stage, // Matrices in SRAM
-    uint32_t n // Tile size
+    const uint32_t size_i, const uint32_t size_j, const uint32_t size_k, // Matrix dimensions
+    float const *a, float const *b, float *c, // Matrices in GMEM
+    float *local_a, float *local_b, float *local_a_stage, float *local_b_stage, // Matrices in SRAM
+    const uint32_t sram_height, const uint32_t sram_width // Tile size
 ) {
     // Math: c_ik = a_i ⋅ b_k
     // Goal: c_ik in registers and a_i, b_k in L1 cache
     // Plan: Each thread works on one c_ik at a time
 
     // Each thread gets a c_ik
-    uint32_t i = threadIdx.x / n;
-    uint32_t k = threadIdx.x % n;
+    const uint32_t i = threadIdx.x / sram_height;
+    const uint32_t k = threadIdx.x % sram_height;
 
     // Keep c_ik in local register
     float local_c_ik = 0.0f;
 
-    // Double buffer dimensions
-    uint32_t buffer_height = n;
-    uint32_t buffer_width = min(size_j, 384)/2;
-
     // Load compute buffer
-    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
-    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+    load_buffer(a, size_j, local_a, sram_height, sram_width);
+    load_buffer(b, size_k, local_b, sram_width, sram_height);
 
     // Iterate over local buffers
-    for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
+    for (uint32_t idx = 0; idx < size_j / sram_width - 1; ++idx) {
         // Move global buffers
-        a += buffer_width;
-        b += buffer_width * size_k;
+        a += sram_width;
+        b += sram_width * size_k;
 
         // Load stage buffer
-        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        load_buffer_async(a, size_j, local_a_stage, sram_height, sram_width);
+        load_buffer_async(b, size_k, local_b_stage, sram_width, sram_height);
 
         // Iterate over a_i, b_k
-        for (uint32_t j = 0; j < buffer_width; ++j) {
-            local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+        for (uint32_t j = 0; j < sram_width; ++j) {
+            local_c_ik += local_a[i * sram_width + j] * local_b[j * sram_height + k];
         }
 
         // Swap double buffers
@@ -126,29 +121,27 @@ __device__ void matmul_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
-    for (uint32_t j = 0; j < buffer_width; ++j) {
-        local_c_ik += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+    for (uint32_t j = 0; j < sram_width; ++j) {
+        local_c_ik += local_a[i * sram_width + j] * local_b[j * sram_height + k];
     }
 
     // Write back to main memory at the end
     c[i * size_k + k] = local_c_ik;
 }
 
+template <uint32_t sram_height, uint32_t sram_width>
 __global__ void matmul_l1(
-    int32_t size_i, int32_t size_j, int32_t size_k,
+    const int32_t size_i, const int32_t size_j, const int32_t size_k,
     float const *a, float const *b, float *c
 ) {
-    // c_ik tiles are 32x32
-    constexpr uint32_t n = 32;
-
     // Grid dimensions
-    uint32_t tiles_per_row = size_k / n;
-    uint32_t tiles_per_col = size_j / n;
+    const uint32_t tiles_per_row = size_k / sram_height;
+    const uint32_t tiles_per_col = size_j / sram_height;
 
     // Setup the block's SRAM
     extern __shared__ float sram[];
     // Split the SRAM into a double buffer
-    uint32_t double_buffer_size = 32 * min(size_j, 384)/2; // 25000/(2*32) = 390
+    const uint32_t double_buffer_size = sram_height * sram_width;
     float *local_a = sram;
     float *local_a_stage = local_a + double_buffer_size;
     float *local_b = local_a_stage + double_buffer_size;
@@ -159,20 +152,20 @@ __global__ void matmul_l1(
         // Tile indices
         // uint32_t tile_i = idx / tiles_per_row; // Row major
         // uint32_t tile_k = idx % tiles_per_row;
-        uint32_t tile_k = idx / tiles_per_col; // Col major
-        uint32_t tile_i = idx % tiles_per_col;
+        const uint32_t tile_k = idx / tiles_per_col; // Col major
+        const uint32_t tile_i = idx % tiles_per_col;
 
         // Move buffers
-        float const *tile_a = a + tile_i * n * size_j;
-        float const *tile_b = b + tile_k * n;
-        float *tile_c = c + tile_i * n * size_j + tile_k * n;
+        float const *tile_a = a + tile_i * sram_height * size_j;
+        float const *tile_b = b + tile_k * sram_height;
+        float *tile_c = c + tile_i * sram_height * size_j + tile_k * sram_height;
 
         matmul_tile(
             size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
             local_a, local_b,
             local_a_stage, local_b_stage,
-            n
+            sram_height, sram_width
         );
     }
 }
@@ -185,13 +178,19 @@ void launch_matmul_l1(
     float const *b,
     float *c) {
     // Setup the block SRAM
-    int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
-    CUDA_CHECK(cudaFuncSetAttribute(
-        matmul_l1,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shmem_size_bytes
-    ));
-    matmul_l1<<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    const int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
+    // c_ik tiles are 32x32 -> sram_height = 32
+    // 25000/(2*32) ~= 390 -> sram_width = min(size_j, 384)/2
+    if (size_j < 128) {
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1<32, 64><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    } else if (size_j < 384) {
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1<32, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1<32, 128><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    } else {
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1<32, 192>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1<32, 192><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    }
 }
 
 // Part 2 lower bound: 17ms
@@ -203,24 +202,24 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+template <uint32_t block_n>
 __device__ void matmul_l1_reg_tile(
-    uint32_t size_i, uint32_t size_j, uint32_t size_k, // Matrix dimensions
+    const uint32_t size_i, const uint32_t size_j, const uint32_t size_k, // Matrix dimensions
     float const *a, float const *b, float *c, // Matrices
     float *local_a, float *local_b, // Matrices in SRAM
     float *local_a_stage, float *local_b_stage, // Matrices in SRAM
-    uint32_t n // Tile size
+    const uint32_t n // Tile size
 ) {
     // Each thread gets a c_ik block
-    uint32_t block_n = n / 32;
-    uint32_t start_i = (threadIdx.x / n) * block_n;
-    uint32_t start_k = (threadIdx.x % n) * block_n;
+    const uint32_t start_i = (threadIdx.x / n) * block_n;
+    const uint32_t start_k = (threadIdx.x % n) * block_n;
 
     // Keep c_ik's in local registers
-    float local_c_ik[36] = {0.0f}; // max of 36
+    float local_c_ik[block_n * block_n] = {0.0f};
 
     // Double buffer dimensions
-    uint32_t buffer_height = n;
-    uint32_t buffer_width = ((25000 / (4 * n)) / 32) * 32;
+    const uint32_t buffer_height = n;
+    const uint32_t buffer_width = ((25000 / (4 * n)) / 32) * 32;
 
     // Load compute buffer
     load_buffer(a, size_j, local_a, buffer_height, buffer_width);
@@ -239,8 +238,8 @@ __device__ void matmul_l1_reg_tile(
         // Iterate over thread c_ik's
         for (uint32_t c_ik_idx = 0; c_ik_idx < block_n * block_n; ++c_ik_idx) {
             // Calculate i,k
-            uint32_t i = start_i + c_ik_idx / block_n;
-            uint32_t k = start_k + c_ik_idx % block_n;
+            const uint32_t i = start_i + c_ik_idx / block_n;
+            const uint32_t k = start_k + c_ik_idx % block_n;
             // Iterate over a_i, b_k
             for (uint32_t j = 0; j < buffer_width; ++j) {
                 local_c_ik[c_ik_idx] += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
@@ -255,8 +254,8 @@ __device__ void matmul_l1_reg_tile(
     }
     // Process last block
     for (uint32_t c_ik_idx = 0; c_ik_idx < block_n * block_n; ++c_ik_idx) {
-        uint32_t i = start_i + c_ik_idx / block_n;
-        uint32_t k = start_k + c_ik_idx % block_n;
+        const uint32_t i = start_i + c_ik_idx / block_n;
+        const uint32_t k = start_k + c_ik_idx % block_n;
         for (uint32_t j = 0; j < buffer_width; ++j) {
             local_c_ik[c_ik_idx] += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
         }
@@ -265,23 +264,23 @@ __device__ void matmul_l1_reg_tile(
     }
 }
 
+template <uint32_t block_n>
 __global__ void matmul_l1_reg(
-    int32_t size_i, int32_t size_j, int32_t size_k,
-    float const *a,  float const *b, float *c,
-    uint32_t block_n
+    const int32_t size_i, const int32_t size_j, const int32_t size_k,
+    float const *a,  float const *b, float *c
 ) {
-    // c_ik tile dimensions
-    uint32_t n = 32 * block_n; // square multiples of 32
+    // c_ik tiles are (32*block_n)x(32*block_n)
+    constexpr uint32_t n = 32 * block_n;
 
     // Grid dimensions
-    uint32_t tiles_per_row = size_k / n;
-    uint32_t tiles_per_col = size_j / n;
+    const uint32_t tiles_per_row = size_k / n;
+    const uint32_t tiles_per_col = size_j / n;
 
     // Setup the block's SRAM
     extern __shared__ float sram[];
     // Split the SRAM into a double buffer
-    uint32_t j_per_row = ((25000 / (4 * n)) / 32) * 32; // max 25000 floats, 4 buffers of n rows, want to be a multiple of 32
-    uint32_t double_buffer_size = n * j_per_row;
+    const uint32_t j_per_row = ((25000 / (4 * n)) / 32) * 32; // max 25000 floats, 4 buffers of n rows, want to be a multiple of 32
+    const uint32_t double_buffer_size = n * j_per_row;
     float *local_a = sram;
     float *local_a_stage = local_a + double_buffer_size;
     float *local_b = local_a_stage + double_buffer_size;
@@ -292,15 +291,15 @@ __global__ void matmul_l1_reg(
         // Tile indices
         // uint32_t tile_i = idx / tiles_per_row; // Row major
         // uint32_t tile_k = idx % tiles_per_row;
-        uint32_t tile_k = idx / tiles_per_col; // Col major
-        uint32_t tile_i = idx % tiles_per_col;
+        const uint32_t tile_k = idx / tiles_per_col; // Col major
+        const uint32_t tile_i = idx % tiles_per_col;
 
         // Move buffers
         float const *tile_a = a + tile_i * n * size_j;
         float const *tile_b = b + tile_k * n;
         float *tile_c = c + tile_i * n * size_j + tile_k * n;
 
-        matmul_l1_reg_tile( size_i, size_j, size_k,
+        matmul_l1_reg_tile<block_n>(size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
             local_a, local_b, local_a_stage, local_b_stage,
             n
@@ -315,19 +314,29 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    // uint32_t c_ik_per_thread = (size_i * size_k) / (48 * 1024); 
-    // c_ik_per_thread = 
-
     // Setup the block SRAM
-    int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
+    const int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
     CUDA_CHECK(cudaFuncSetAttribute(
-        matmul_l1_reg,
+        matmul_l1_reg<1>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes
     ));
-    // uint32_t block_n = size_i == 3072 ? 6 : 1; // 36 c_ik's per thread in the large matrix
-    uint32_t block_n = 1;
-    matmul_l1_reg<<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c, block_n);
+    // Call the kernel based on the c_ik_per_thread
+    // uint32_t idx = size_i / 32;
+    // if (idx <= 13) {
+    //     matmul_l1_reg<1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    // } else if (idx <= 20) {
+    //     matmul_l1_reg<2><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    // } else if (idx <= 27) {
+    //     matmul_l1_reg<3><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    // } else if (idx <= 34) {
+    //     matmul_l1_reg<4><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    // } else if (idx <= 41) {
+    //     matmul_l1_reg<5><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    // } else {
+    //     matmul_l1_reg<6><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    // }
+    matmul_l1_reg<1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1_reg
