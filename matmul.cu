@@ -63,6 +63,19 @@ __device__ void load_buffer(
     }
     __syncthreads();
 }
+__device__ void load_buffer_transpose(
+    float const *src, uint32_t src_width, 
+    float *dst, uint32_t dst_height, uint32_t dst_width
+) {
+    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
+        // Get index to copy
+        uint32_t i = idx / dst_width;
+        uint32_t j = idx % dst_width;
+        // Transpose while copying: dst[j * dst_height + i] = src[i * src_width + j];
+        dst[j * dst_height + i] = src[i * src_width + j];
+    }
+    __syncthreads();
+}
 
 __device__ void load_buffer_async(
     float const *src, uint32_t src_width, 
@@ -75,6 +88,17 @@ __device__ void load_buffer_async(
         uint32_t j = flat_idx % dst_width;
         // Copy mem over
         __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
+    }
+    __pipeline_commit();
+}
+__device__ void load_buffer_transpose_async(
+    float const *src, uint32_t src_width, 
+    float *dst, uint32_t dst_height, uint32_t dst_width
+) {
+    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
+        uint32_t i = idx / dst_width;
+        uint32_t j = idx % dst_width;
+        __pipeline_memcpy_async(&dst[j * dst_height + i], &src[i * src_width + j], sizeof(float), 0);
     }
     __pipeline_commit();
 }
@@ -103,17 +127,20 @@ __device__ void matmul_tile(
 
     // Load compute buffer
     load_buffer(a, size_j, local_a, buffer_height, buffer_width);
-    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+    // load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+    load_buffer_transpose(b, size_k, local_b, buffer_height, buffer_width);
 
     // Iterate over local buffers
     for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
         // Move global buffers
         a += buffer_width;
-        b += buffer_width * size_k;
+        // b += buffer_width * size_k;
+        b += buffer_width;
 
         // Load stage buffer
         load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        // load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        load_buffer_transpose_async(b, size_k, local_b_stage, buffer_height, buffer_width);
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < buffer_width; ++j) {
@@ -179,7 +206,8 @@ __global__ void matmul_l1(
 
         // Move buffers
         float const *tile_a = a + tile_i * n * size_j;
-        float const *tile_b = b + tile_k * n;
+        // float const *tile_b = b + tile_k * n;
+        float const *tile_b = b + tile_k * n * size_j;
         float *tile_c = c + tile_i * n * size_j + tile_k * n;
 
         matmul_tile(
@@ -192,6 +220,21 @@ __global__ void matmul_l1(
     }
 }
 
+__global__ void transpose_square_matrix(float *matrix, uint32_t n) {
+    uint32_t tot_threads = gridDim.x * blockDim.x;
+    uint32_t thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint32_t idx = thread_index; idx < n * n; idx += tot_threads) {
+        uint32_t i = idx / n;
+        uint32_t j = idx % n;
+        // Swap matrix[i][j] with matrix[j][i]
+        if (i < j) {
+            float temp = matrix[i * n + j];
+            matrix[i * n + j] = matrix[j * n + i];
+            matrix[j * n + i] = temp;
+        }
+    }
+}
+
 void launch_matmul_l1(
     int32_t size_i,
     int32_t size_j,
@@ -199,6 +242,9 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
+    // We want: a -> row major, b -> col major, c -> row major
+    transpose_square_matrix<<<48, 32 * 32>>>(const_cast<float*>(b), size_j); // Separate kernel so synchronizes across the grid
+
     // Setup the block SRAM
     int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
     CUDA_CHECK(cudaFuncSetAttribute(
