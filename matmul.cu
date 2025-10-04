@@ -231,11 +231,11 @@ __device__ void matmul_l1_reg_tile(
 
         // Iterate over a_i, b_k
         for (uint32_t j = 0; j < sram_width; ++j) {
-            for (uint32_t k = 0; k < c_ik_size; ++k) {
-                float tmp = local_b[j * sram_height + start_k + k];
-                for (uint32_t i = 0; i < c_ik_size; ++i) {
-                    local_c_ik[i * c_ik_size + k] += local_a[(start_i + i) * sram_width + j] * tmp;
-                }
+            for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
+                // Calculate i,k
+                const uint32_t i = start_i + c_ik_idx / c_ik_size;
+                const uint32_t k = start_k + c_ik_idx % c_ik_size;
+                local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
             }
         }
 
@@ -247,23 +247,23 @@ __device__ void matmul_l1_reg_tile(
     }
     // Process last block
     for (uint32_t j = 0; j < sram_width; ++j) {
-        for (uint32_t k = 0; k < c_ik_size; ++k) {
-            float tmp = local_b[j * sram_height + start_k + k];
-            for (uint32_t i = 0; i < c_ik_size; ++i) {
-                local_c_ik[i * c_ik_size + k] += local_a[(start_i + i) * sram_width + j] * tmp;
-            }
+        for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
+            const uint32_t i = start_i + c_ik_idx / c_ik_size;
+            const uint32_t k = start_k + c_ik_idx % c_ik_size;
+            local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
         }
     }
 
     // Write back to main memory at the end
-    for (uint32_t k = 0; k < c_ik_size; ++k) {
-        for (uint32_t i = 0; i < c_ik_size; ++i) {
-            c[(start_i + i) * size_k + start_k + k] = local_c_ik[i * c_ik_size + k];
-        }
+    for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
+        const uint32_t i = start_i + c_ik_idx / c_ik_size;
+        const uint32_t k = start_k + c_ik_idx % c_ik_size;
+        c[i * size_k + k] = local_c_ik[c_ik_idx];
     }
 }
 
 template <uint32_t sram_height, uint32_t sram_width, uint32_t c_ik_size>
+__launch_bounds__(1024)
 __global__ void matmul_l1_reg(
     const int32_t size_i, const int32_t size_j, const int32_t size_k,
     float const *a,  float const *b, float *c
@@ -320,8 +320,8 @@ void launch_matmul_l1_reg(
         CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 128, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
         matmul_l1_reg<32, 128, 1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     } else {
-        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<192, 32, 6>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
-        matmul_l1_reg<192, 32, 6><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<96, 64, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<96, 64, 3><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     }
 }
 
