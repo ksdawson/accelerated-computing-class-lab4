@@ -230,12 +230,16 @@ __device__ void matmul_l1_reg_tile(
         load_buffer_async(b, size_k, local_b_stage, sram_width, sram_height);
 
         // Iterate over a_i, b_k
+        #pragma unroll
         for (uint32_t j = 0; j < sram_width; ++j) {
-            for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
-                // Calculate i,k
-                const uint32_t i = start_i + c_ik_idx / c_ik_size;
-                const uint32_t k = start_k + c_ik_idx % c_ik_size;
-                local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
+            const uint32_t b_j_offset = j * sram_height + start_k;
+            #pragma unroll
+            for (uint32_t k = 0; k < c_ik_size; ++k) {
+                const float tmp = local_b[b_j_offset + k];
+                #pragma unroll
+                for (uint32_t i = 0; i < c_ik_size; ++i) {
+                    local_c_ik[i * c_ik_size + k] += local_a[(start_i + i) * sram_width + j] * tmp;
+                }
             }
         }
 
@@ -246,15 +250,21 @@ __device__ void matmul_l1_reg_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
+    #pragma unroll
     for (uint32_t j = 0; j < sram_width; ++j) {
-        for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
-            const uint32_t i = start_i + c_ik_idx / c_ik_size;
-            const uint32_t k = start_k + c_ik_idx % c_ik_size;
-            local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
+        const uint32_t b_j_offset = j * sram_height + start_k;
+        #pragma unroll
+        for (uint32_t k = 0; k < c_ik_size; ++k) {
+            const float tmp = local_b[b_j_offset + k];
+            #pragma unroll
+            for (uint32_t i = 0; i < c_ik_size; ++i) {
+                local_c_ik[i * c_ik_size + k] += local_a[(start_i + i) * sram_width + j] * tmp;
+            }
         }
     }
 
     // Write back to main memory at the end
+    #pragma unroll
     for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
         const uint32_t i = start_i + c_ik_idx / c_ik_size;
         const uint32_t k = start_k + c_ik_idx % c_ik_size;
