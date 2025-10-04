@@ -330,8 +330,8 @@ void launch_matmul_l1_reg(
         CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 128, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
         matmul_l1_reg<32, 128, 1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     } else {
-        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<96, 64, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
-        matmul_l1_reg<96, 64, 3><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<192, 32, 6>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<192, 32, 6><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     }
 }
 
