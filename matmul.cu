@@ -202,16 +202,15 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
-template <uint32_t sram_height, uint32_t sram_width>
+template <uint32_t sram_height, uint32_t sram_width, uint32_t c_ik_size>
 __device__ void matmul_l1_reg_tile(
     const uint32_t size_i, const uint32_t size_j, const uint32_t size_k, // Matrix dimensions
     float const *a, float const *b, float *c, // Matrices in GMEM
     float *local_a, float *local_b, float *local_a_stage, float *local_b_stage // Matrices in SRAM
 ) {
     // Each thread gets a c_ik block
-    constexpr uint32_t c_ik_size = sram_height / 32;
-    const uint32_t start_i = (threadIdx.x / sram_height) * c_ik_size;
-    const uint32_t start_k = (threadIdx.x % sram_height) * c_ik_size;
+    const uint32_t start_i = (threadIdx.x / (sram_height / c_ik_size)) * c_ik_size;
+    const uint32_t start_k = (threadIdx.x % (sram_height / c_ik_size)) * c_ik_size;
 
     // Keep c_ik's in local registers
     float local_c_ik[c_ik_size * c_ik_size] = {0.0f};
@@ -259,7 +258,7 @@ __device__ void matmul_l1_reg_tile(
     }
 }
 
-template <uint32_t sram_height, uint32_t sram_width>
+template <uint32_t sram_height, uint32_t sram_width, uint32_t c_ik_size>
 __global__ void matmul_l1_reg(
     const int32_t size_i, const int32_t size_j, const int32_t size_k,
     float const *a,  float const *b, float *c
@@ -290,7 +289,7 @@ __global__ void matmul_l1_reg(
         float const *tile_b = b + tile_k * sram_height;
         float *tile_c = c + tile_i * sram_height * size_j + tile_k * sram_height;
 
-        matmul_l1_reg_tile<sram_height, sram_width>(
+        matmul_l1_reg_tile<sram_height, sram_width, c_ik_size>(
             size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
             local_a, local_b,
@@ -310,14 +309,14 @@ void launch_matmul_l1_reg(
     const int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
     // Call the kernel based on the c_ik_per_thread
     if (size_j < 128) {
-        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
-        matmul_l1_reg<32, 64><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 64, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<32, 64, 1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     } else if (size_j < 384) {
-        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
-        matmul_l1_reg<32, 128><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 128, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<32, 128, 1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     } else {
-        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 192>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
-        matmul_l1_reg<32, 192><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<192, 32, 6>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<192, 32, 6><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
     }
 }
 
