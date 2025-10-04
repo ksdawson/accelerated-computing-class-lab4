@@ -48,16 +48,34 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem)
 
+// __device__ void load_buffer(
+//     float const *src, uint32_t src_width, 
+//     float *dst, const uint32_t dst_height, const uint32_t dst_width
+// ) {
+//     for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
+//         // Get index to copy
+//         const uint32_t i = idx / dst_width;
+//         const uint32_t j = idx % dst_width;
+//         // Copy mem over
+//         dst[i * dst_width + j] = src[i * src_width + j];
+//     }
+//     __syncthreads();
+// }
 __device__ void load_buffer(
-    float const *src, uint32_t src_width, 
-    float *dst, const uint32_t dst_height, const uint32_t dst_width
+    const float *src, uint32_t src_width,
+    float *dst, uint32_t dst_height, uint32_t dst_width
 ) {
-    for (uint32_t idx = threadIdx.x; idx < dst_height * dst_width; idx += blockDim.x) {
-        // Get index to copy
-        const uint32_t i = idx / dst_width;
-        const uint32_t j = idx % dst_width;
-        // Copy mem over
-        dst[i * dst_width + j] = src[i * src_width + j];
+    const uint32_t vec_width = dst_width / 4;
+    const float4 *src4 = reinterpret_cast<const float4*>(src);
+    float4 *dst4 = reinterpret_cast<float4*>(dst);
+    const uint32_t src_vec_width = src_width / 4;
+    for (uint32_t idx = threadIdx.x; idx < dst_height * vec_width; idx += blockDim.x) {
+        // Compute 2D index in terms of float4s
+        const uint32_t i = idx / vec_width;
+        const uint32_t j = idx % vec_width;
+        // Vectorized load and store
+        float4 val = src4[i * src_vec_width + j];
+        dst4[i * vec_width + j] = val;
     }
     __syncthreads();
 }
