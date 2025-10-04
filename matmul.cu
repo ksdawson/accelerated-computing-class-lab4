@@ -229,14 +229,13 @@ __device__ void matmul_l1_reg_tile(
         load_buffer_async(a, size_j, local_a_stage, sram_height, sram_width);
         load_buffer_async(b, size_k, local_b_stage, sram_width, sram_height);
 
-        // Iterate over thread c_ik's
-        for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
-            // Calculate i,k
-            const uint32_t i = start_i + c_ik_idx / c_ik_size;
-            const uint32_t k = start_k + c_ik_idx % c_ik_size;
-            // Iterate over a_i, b_k
-            for (uint32_t j = 0; j < sram_width; ++j) {
-                local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
+        // Iterate over a_i, b_k
+        for (uint32_t j = 0; j < sram_width; ++j) {
+            for (uint32_t k = 0; k < c_ik_size; ++k) {
+                float tmp = local_b[j * sram_height + start_k + k];
+                for (uint32_t i = 0; i < c_ik_size; ++i) {
+                    local_c_ik[i * c_ik_size + k] += local_a[(start_i + i) * sram_width + j] * tmp;
+                }
             }
         }
 
@@ -247,14 +246,20 @@ __device__ void matmul_l1_reg_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
-    for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
-        const uint32_t i = start_i + c_ik_idx / c_ik_size;
-        const uint32_t k = start_k + c_ik_idx % c_ik_size;
-        for (uint32_t j = 0; j < sram_width; ++j) {
-            local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
+    for (uint32_t j = 0; j < sram_width; ++j) {
+        for (uint32_t k = 0; k < c_ik_size; ++k) {
+            float tmp = local_b[j * sram_height + start_k + k];
+            for (uint32_t i = 0; i < c_ik_size; ++i) {
+                local_c_ik[i * c_ik_size + k] += local_a[(start_i + i) * sram_width + j] * tmp;
+            }
         }
-        // Write back to main memory at the end
-        c[i * size_k + k] = local_c_ik[c_ik_idx];
+    }
+
+    // Write back to main memory at the end
+    for (uint32_t k = 0; k < c_ik_size; ++k) {
+        for (uint32_t i = 0; i < c_ik_size; ++i) {
+            c[(start_i + i) * size_k + start_k + k] = local_c_ik[i * c_ik_size + k];
+        }
     }
 }
 
