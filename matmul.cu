@@ -141,7 +141,7 @@ __global__ void matmul_l1(
     // Setup the block's SRAM
     extern __shared__ float sram[];
     // Split the SRAM into a double buffer
-    const uint32_t double_buffer_size = sram_height * sram_width;
+    constexpr uint32_t double_buffer_size = sram_height * sram_width;
     float *local_a = sram;
     float *local_a_stage = local_a + double_buffer_size;
     float *local_b = local_a_stage + double_buffer_size;
@@ -202,47 +202,42 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
-template <uint32_t block_n>
+template <uint32_t sram_height, uint32_t sram_width>
 __device__ void matmul_l1_reg_tile(
     const uint32_t size_i, const uint32_t size_j, const uint32_t size_k, // Matrix dimensions
-    float const *a, float const *b, float *c, // Matrices
-    float *local_a, float *local_b, // Matrices in SRAM
-    float *local_a_stage, float *local_b_stage, // Matrices in SRAM
-    const uint32_t n // Tile size
+    float const *a, float const *b, float *c, // Matrices in GMEM
+    float *local_a, float *local_b, float *local_a_stage, float *local_b_stage // Matrices in SRAM
 ) {
     // Each thread gets a c_ik block
-    const uint32_t start_i = (threadIdx.x / n) * block_n;
-    const uint32_t start_k = (threadIdx.x % n) * block_n;
+    constexpr uint32_t c_ik_size = sram_height / 32;
+    const uint32_t start_i = (threadIdx.x / sram_height) * c_ik_size;
+    const uint32_t start_k = (threadIdx.x % sram_height) * c_ik_size;
 
     // Keep c_ik's in local registers
-    float local_c_ik[block_n * block_n] = {0.0f};
-
-    // Double buffer dimensions
-    const uint32_t buffer_height = n;
-    const uint32_t buffer_width = ((25000 / (4 * n)) / 32) * 32;
+    float local_c_ik[c_ik_size * c_ik_size] = {0.0f};
 
     // Load compute buffer
-    load_buffer(a, size_j, local_a, buffer_height, buffer_width);
-    load_buffer(b, size_k, local_b, buffer_width, buffer_height);
+    load_buffer(a, size_j, local_a, sram_height, sram_width);
+    load_buffer(b, size_k, local_b, sram_width, sram_height);
 
     // Iterate over local buffers
-    for (uint32_t idx = 0; idx < size_j / buffer_width - 1; ++idx) {
+    for (uint32_t idx = 0; idx < size_j / sram_width - 1; ++idx) {
         // Move global buffers
-        a += buffer_width;
-        b += buffer_width * size_k;
+        a += sram_width;
+        b += sram_width * size_k;
 
         // Load stage buffer
-        load_buffer_async(a, size_j, local_a_stage, buffer_height, buffer_width);
-        load_buffer_async(b, size_k, local_b_stage, buffer_width, buffer_height);
+        load_buffer_async(a, size_j, local_a_stage, sram_height, sram_width);
+        load_buffer_async(b, size_k, local_b_stage, sram_width, sram_height);
 
         // Iterate over thread c_ik's
-        for (uint32_t c_ik_idx = 0; c_ik_idx < block_n * block_n; ++c_ik_idx) {
+        for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
             // Calculate i,k
-            const uint32_t i = start_i + c_ik_idx / block_n;
-            const uint32_t k = start_k + c_ik_idx % block_n;
+            const uint32_t i = start_i + c_ik_idx / c_ik_size;
+            const uint32_t k = start_k + c_ik_idx % c_ik_size;
             // Iterate over a_i, b_k
-            for (uint32_t j = 0; j < buffer_width; ++j) {
-                local_c_ik[c_ik_idx] += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+            for (uint32_t j = 0; j < sram_width; ++j) {
+                local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
             }
         }
 
@@ -253,34 +248,30 @@ __device__ void matmul_l1_reg_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
-    for (uint32_t c_ik_idx = 0; c_ik_idx < block_n * block_n; ++c_ik_idx) {
-        const uint32_t i = start_i + c_ik_idx / block_n;
-        const uint32_t k = start_k + c_ik_idx % block_n;
-        for (uint32_t j = 0; j < buffer_width; ++j) {
-            local_c_ik[c_ik_idx] += local_a[i * buffer_width + j] * local_b[j * buffer_height + k];
+    for (uint32_t c_ik_idx = 0; c_ik_idx < c_ik_size * c_ik_size; ++c_ik_idx) {
+        const uint32_t i = start_i + c_ik_idx / c_ik_size;
+        const uint32_t k = start_k + c_ik_idx % c_ik_size;
+        for (uint32_t j = 0; j < sram_width; ++j) {
+            local_c_ik[c_ik_idx] += local_a[i * sram_width + j] * local_b[j * sram_height + k];
         }
         // Write back to main memory at the end
         c[i * size_k + k] = local_c_ik[c_ik_idx];
     }
 }
 
-template <uint32_t block_n>
+template <uint32_t sram_height, uint32_t sram_width>
 __global__ void matmul_l1_reg(
     const int32_t size_i, const int32_t size_j, const int32_t size_k,
     float const *a,  float const *b, float *c
 ) {
-    // c_ik tiles are (32*block_n)x(32*block_n)
-    constexpr uint32_t n = 32 * block_n;
-
     // Grid dimensions
-    const uint32_t tiles_per_row = size_k / n;
-    const uint32_t tiles_per_col = size_j / n;
+    const uint32_t tiles_per_row = size_k / sram_height;
+    const uint32_t tiles_per_col = size_j / sram_height;
 
     // Setup the block's SRAM
     extern __shared__ float sram[];
     // Split the SRAM into a double buffer
-    const uint32_t j_per_row = ((25000 / (4 * n)) / 32) * 32; // max 25000 floats, 4 buffers of n rows, want to be a multiple of 32
-    const uint32_t double_buffer_size = n * j_per_row;
+    constexpr uint32_t double_buffer_size = sram_height * sram_width;
     float *local_a = sram;
     float *local_a_stage = local_a + double_buffer_size;
     float *local_b = local_a_stage + double_buffer_size;
@@ -295,14 +286,15 @@ __global__ void matmul_l1_reg(
         const uint32_t tile_i = idx % tiles_per_col;
 
         // Move buffers
-        float const *tile_a = a + tile_i * n * size_j;
-        float const *tile_b = b + tile_k * n;
-        float *tile_c = c + tile_i * n * size_j + tile_k * n;
+        float const *tile_a = a + tile_i * sram_height * size_j;
+        float const *tile_b = b + tile_k * sram_height;
+        float *tile_c = c + tile_i * sram_height * size_j + tile_k * sram_height;
 
-        matmul_l1_reg_tile<block_n>(size_i, size_j, size_k,
+        matmul_l1_reg_tile<sram_height, sram_width>(
+            size_i, size_j, size_k,
             tile_a, tile_b, tile_c,
-            local_a, local_b, local_a_stage, local_b_stage,
-            n
+            local_a, local_b,
+            local_a_stage, local_b_stage
         );
     }
 }
@@ -316,27 +308,17 @@ void launch_matmul_l1_reg(
     float *c) {
     // Setup the block SRAM
     const int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
-    CUDA_CHECK(cudaFuncSetAttribute(
-        matmul_l1_reg<1>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shmem_size_bytes
-    ));
     // Call the kernel based on the c_ik_per_thread
-    // uint32_t idx = size_i / 32;
-    // if (idx <= 13) {
-    //     matmul_l1_reg<1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
-    // } else if (idx <= 20) {
-    //     matmul_l1_reg<2><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
-    // } else if (idx <= 27) {
-    //     matmul_l1_reg<3><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
-    // } else if (idx <= 34) {
-    //     matmul_l1_reg<4><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
-    // } else if (idx <= 41) {
-    //     matmul_l1_reg<5><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
-    // } else {
-    //     matmul_l1_reg<6><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
-    // }
-    matmul_l1_reg<1><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    if (size_j < 128) {
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<32, 64><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    } else if (size_j < 384) {
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<32, 128><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    } else {
+        CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg<32, 192>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+        matmul_l1_reg<32, 192><<<48, 32 * 32, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    }
 }
 
 }; // namespace matmul_l1_reg
